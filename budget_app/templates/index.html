@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Household Budget</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💰</text></svg>">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">$</div> Household Budget</div>
+      <nav class="nav">
+        <a href="#/dashboard" data-view="dashboard"><span class="nav-ico">◎</span> Dashboard</a>
+        <a href="#/transactions" data-view="transactions"><span class="nav-ico">≡</span> Transactions <span class="badge warn hidden" id="nav-review"></span></a>
+        <a href="#/receipts" data-view="receipts"><span class="nav-ico">🧾</span> Receipts</a>
+        <a href="#/budget" data-view="budget"><span class="nav-ico">✉</span> Budget</a>
+        <a href="#/reports" data-view="reports"><span class="nav-ico">▤</span> Reports</a>
+        <a href="#/settings" data-view="settings"><span class="nav-ico">⚙</span> Settings</a>
+      </nav>
+      <div class="sidebar-foot" id="ai-status"></div>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <h1 id="page-title">Dashboard</h1>
+        <div class="month-switch" id="month-switch">
+          <button data-step="-1" title="Previous month">‹</button>
+          <span class="label" id="month-label"></span>
+          <button data-step="1" title="Next month">›</button>
+        </div>
+        <div class="spacer"></div>
+        <button class="primary" id="quick-add">＋ Add expense</button>
+      </div>
+      <div id="view"></div>
+    </main>
+  </div>
+  <div class="toasts" id="toasts"></div>
+  <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# Personal financial data never goes in the repo
+data/
+*.db
+*.db-journal
+*.xlsx
+*.xlsm
+*.csv
+!tests/fixtures/*.csv
+Statements/
+receipts/
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

@@ -3,7 +3,8 @@
 A local envelope-budgeting app that replaces a yearly Excel budget. It runs on your own computer, keeps every number in one local file, and does most of the typing for you.
 
 - **Imports your old spreadsheet**: every year, every envelope, every amount inside the `=12.34+56.78` formulas. Carried-over balances are reconciled so they match the spreadsheet to the cent.
-- **Imports card statements (CSV)**: purchases are sorted automatically by merchant rules that learn as you categorize ("Always put *Ulta* in *Beauty*?"). Card payments are recognized and left out of the budget.
+- **Imports card statements and bank accounts (CSV)**: purchases are sorted automatically by merchant rules that learn as you categorize ("Always put *Ulta* in *Beauty*?"). From bank accounts, bills are budgeted, paychecks and interest become income (optionally for next month's budget), and transfers and card payments are left out.
+- **Learns from your spreadsheet**: statements for months the spreadsheet already covers aren't added twice; they're matched to the spreadsheet entries (same month and amount) to give your history real merchant names and to learn merchant rules from how you categorized.
 - **Receipts**: drop in photos, PDFs or pasted email receipts. AI (a free local model through Ollama, or Claude) reads every line item, sorts each into an envelope/subcategory, finds the matching card charge, and splits that charge (tax spread proportionally). One $180 Meijer charge becomes Groceries › Produce, Toiletries, House › Household Supplies, …
 - **Amazon**: import your Amazon order history. Each shipment is matched to its card charge and split by item.
 - **Email receipts**: connect Gmail/Outlook/IMAP mailboxes (read-only). Order confirmations and digital receipts are found, read, matched to card charges and split, with no typing.
@@ -26,7 +27,7 @@ On Windows you can double-click **Start Budget.bat**.
 
 ### First-time setup
 1. **Settings → Import & data**: drop in your budget `.xlsx`.
-2. **Transactions → Import statement**: drop in your card's CSV export.
+2. **Transactions → Import statement**: drop in your card and bank CSV exports (several at once is fine). Include a few past months your spreadsheet already covers so the app can learn how you categorize.
 3. **Settings → AI & receipts** (optional): turn on automatic receipt reading and category suggestions. Everything else works without it. Pick one:
    - **Local (Ollama)**: free, and nothing leaves your computer. Install [Ollama](https://ollama.com), run `ollama pull qwen3.5:4b` (or any model that reads images), then choose it in Settings. A receipt takes about 15 seconds; if the items or tax don't add up, it's re-read carefully (about 1 minute).
    - **Claude**: most accurate on crumpled or long receipts. Paste an Anthropic API key from <https://console.anthropic.com/>. A few cents per receipt.

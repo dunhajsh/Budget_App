@@ -83,6 +83,7 @@ def get_settings():
         ollama_url=ai.ollama_url(db),
         ollama_model=ai.ollama_model(db),
         ollama_think=get_setting(db, "ollama_think") or "auto",
+        income_month_offset=int(get_setting(db, "income_month_offset") or 0),
     )
 
 
@@ -96,6 +97,10 @@ def put_settings():
         abort(400, "ai_provider must be anthropic or ollama")
     if b.get("ollama_think") not in (None, "auto", "always", "never"):
         abort(400, "ollama_think must be auto, always or never")
+    if "income_month_offset" in b:
+        if str(b["income_month_offset"]) not in ("0", "1"):
+            abort(400, "income_month_offset must be 0 or 1")
+        set_setting(db, "income_month_offset", str(b["income_month_offset"]))
     for k in ("categorization_notes", "default_account", "ai_provider", "ollama_url", "ollama_model", "ollama_think"):
         if k in b:
             set_setting(db, k, (b[k] or "").strip() if k.startswith("ollama") else b[k])
@@ -421,9 +426,10 @@ def import_statement():
     if not f:
         raise ValueError("Choose a CSV file")
     text = f.read().decode("utf-8-sig", errors="replace")
-    account = request.form.get("account") or get_setting(db, "default_account") or "Credit Card"
+    account = (request.form.get("account") or "").strip() or None
     res = statement.import_statement(db, text, f.filename, account, request.form.get("budget_month") or None)
-    set_setting(db, "default_account", account)
+    if res.get("kind") == "card" and account:
+        set_setting(db, "default_account", account)
     db.commit()
     return jsonify(res)
 
@@ -433,15 +439,10 @@ def preview_statement():
     f = request.files.get("file")
     if not f:
         raise ValueError("Choose a CSV file")
-    txns = statement.parse_csv(f.read().decode("utf-8-sig", errors="replace"))
-    return jsonify(
-        count=len(txns),
-        budget_month=statement.guess_budget_month(txns, f.filename),
-        first=min((t["date"] for t in txns), default=None),
-        last=max((t["date"] for t in txns), default=None),
-        total_spent=round(sum(t["amount"] for t in txns if not t["excluded"]), 2),
-        payments=sum(1 for t in txns if t["excluded"]),
-    )
+    db = get_db()
+    p = statement.preview(db, f.read().decode("utf-8-sig", errors="replace"), f.filename)
+    p["account"] = statement.guess_account(f.filename, p["kind"], get_setting(db, "default_account"))
+    return jsonify(p)
 
 
 @bp.get("/import/batches")
@@ -455,6 +456,7 @@ def undo_batch(bid):
     db.execute("UPDATE receipts SET transaction_id = NULL, status = 'parsed' WHERE transaction_id IN "
                "(SELECT id FROM transactions WHERE batch_id = ?)", (bid,))
     n = db.execute("DELETE FROM transactions WHERE batch_id = ?", (bid,)).rowcount
+    n += db.execute("DELETE FROM income WHERE batch_id = ?", (bid,)).rowcount
     db.execute("DELETE FROM import_batches WHERE id = ?", (bid,))
     db.commit()
     return jsonify(deleted=n)
@@ -548,6 +550,23 @@ def add_income():
                      (_month(b.get("month") or d[:7]), d, round(float(b["amount"]), 2), b.get("description") or "Paycheck"))
     db.commit()
     return jsonify(id=cur.lastrowid), 201
+
+
+@bp.post("/transactions/<int:tid>/to-income")
+def transaction_to_income(tid):
+    """A deposit that is really income (e.g. a side job paid by Zelle): move it to the income list."""
+    db = get_db()
+    t = db.execute("SELECT * FROM transactions WHERE id = ?", (tid,)).fetchone()
+    if not t:
+        abort(404)
+    if t["amount"] >= 0:
+        raise ValueError("Only deposits/credits can be counted as income")
+    month = _month(_body().get("month") or month_add(t["budget_month"], statement.income_offset(db)))
+    db.execute("INSERT INTO income(month, date, amount, description, source, batch_id) VALUES (?, ?, ?, ?, 'statement', ?)",
+               (month, t["date"], -t["amount"], t["description"], t["batch_id"]))
+    db.execute("DELETE FROM transactions WHERE id = ?", (tid,))
+    db.commit()
+    return jsonify(ok=True, month=month)
 
 
 @bp.delete("/income/<int:iid>")

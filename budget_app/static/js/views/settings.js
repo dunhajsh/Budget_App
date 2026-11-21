@@ -9,7 +9,7 @@ const TABS = [
 let tab = "import";
 
 async function importTab(el) {
-  const batches = await api("/import/batches");
+  const [batches, settings] = await Promise.all([api("/import/batches"), api("/settings")]);
   const welcome = hashParams().get("welcome");
   el.innerHTML = `<div class="stack">
     ${welcome || !state.status.has_categories ? `<div class="alert info"><span class="ico">👋</span><span><b>Welcome!</b> Start by importing your existing budget
@@ -21,12 +21,16 @@ async function importTab(el) {
         <div class="dropzone" id="xz"><div class="big">📊</div><b>Drop the workbook</b> or click<input type="file" accept=".xlsx,.xlsm" hidden></div>
         <label class="row small" style="margin-top:8px"><input type="checkbox" id="xreplace" checked> Replace history previously imported from a spreadsheet</label>
       </div>
-      <div class="panel"><h2>Card statements</h2>
-        <p class="small muted">Download your statement as CSV from your card's website and import it - every purchase arrives pre-sorted using your rules.</p>
-        <button class="primary" data-stmt>⬆ Import statement</button>
+      <div class="panel"><h2>Card statements & bank accounts</h2>
+        <p class="small muted">Download CSVs from your card's and bank's websites and import them - every purchase arrives pre-sorted using your rules,
+          bank bills and paychecks included.</p>
+        <button class="primary" data-stmt>⬆ Import statements</button>
+        <label class="field" style="margin-top:12px">Paychecks count toward
+          <select id="incoff"><option value="0" ${settings.income_month_offset ? "" : "selected"}>the month they're received</option>
+            <option value="1" ${settings.income_month_offset ? "selected" : ""}>next month's budget (this month's pay funds next month)</option></select></label>
         <h3 style="margin-top:18px">Import history</h3>
-        <table>${batches.filter((b) => b.kind === "statement").map((b) => `<tr><td>${esc(b.filename)}<div class="small muted">${b.created_at} · ${b.row_count} rows · ${b.budget_month}</div></td>
-          <td><button class="small danger" data-undo="${b.id}">Undo</button></td></tr>`).join("") || `<tr><td class="muted small">No statements imported yet.</td></tr>`}</table>
+        <table>${batches.filter((b) => b.kind === "statement" || b.kind === "bank").map((b) => `<tr><td>${esc(b.filename)}<div class="small muted">${b.created_at} · ${b.row_count} rows${b.budget_month ? " · " + b.budget_month : ""}</div></td>
+          <td>${b.row_count ? `<button class="small danger" data-undo="${b.id}">Undo</button>` : `<span class="small muted" title="Covered by your spreadsheet: used to add merchant names and learn rules">history only</span>`}</td></tr>`).join("") || `<tr><td class="muted small">No statements imported yet.</td></tr>`}</table>
       </div>
     </div>
     <div class="panel"><h2>Backup</h2>
@@ -55,8 +59,12 @@ async function importTab(el) {
   dz.ondragleave = () => dz.classList.remove("drag");
   dz.ondrop = (e) => { e.preventDefault(); e.dataTransfer.files[0] && go(e.dataTransfer.files[0]); };
   el.querySelector("[data-stmt]").onclick = importDialog;
+  el.querySelector("#incoff").onchange = async (e) => {
+    await api("/settings", { method: "PUT", body: { income_month_offset: +e.target.value } });
+    toast("Saved - applies to future imports");
+  };
   el.querySelectorAll("[data-undo]").forEach((b) => (b.onclick = async () => {
-    if (!confirm("Remove every transaction from this import?")) return;
+    if (!confirm("Remove every transaction and paycheck from this import?")) return;
     const r = await api(`/import/batches/${b.dataset.undo}`, { method: "DELETE" });
     toast(`Removed ${r.deleted} transactions`);
     render();

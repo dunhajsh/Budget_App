@@ -196,8 +196,16 @@ def init_db(path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = connect(path)
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     conn.close()
+
+
+def _migrate(conn):
+    """Columns added after the first release (CREATE TABLE IF NOT EXISTS won't add them)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(income)")}
+    if "batch_id" not in cols:
+        conn.execute("ALTER TABLE income ADD COLUMN batch_id INTEGER")
 
 
 def rows(cursor):

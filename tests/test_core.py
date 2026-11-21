@@ -224,6 +224,118 @@ class AmazonTests(unittest.TestCase):
         self.assertEqual(again["already_imported"], 2)
 
 
+BANK_CSV = """Date,Description,Type,Amount,Current balance,Status
+2026-03-14,ACME CORP PAYROLL,DIRECT_DEPOSIT,2500.00,5000.00,Posted
+2026-03-10,MORTGAGE CO,DIRECT_PAY,-1500.00,2500.00,Posted
+2026-03-05,CITY WATER,DIRECT_PAY,-60.00,4000.00,Posted
+2026-03-02,CITY WATER,DIRECT_PAY,-55.00,4060.00,Posted
+2026-02-28,Interest earned,INTEREST_EARNED,4.10,4115.00,Posted
+2026-02-20,ACME CORP PAYROLL,DIRECT_DEPOSIT,2500.00,4110.90,Posted
+2026-02-16,BIG BANK CC PAY,DIRECT_PAY,-900.00,1610.90,Posted
+2026-02-11,CITY WATER,DIRECT_PAY,-58.00,2510.90,Posted
+2026-02-10,MORTGAGE CO,DIRECT_PAY,-1500.00,2568.90,Posted
+2026-02-03,To Checking - 1234,WITHDRAWAL,-100.00,4068.90,Posted
+2026-02-02,FRIEND REIMBURSED,ZELLE,45.00,4168.90,Posted
+2026-01-10,MORTGAGE CO,DIRECT_PAY,-1500.00,4123.90,Posted
+2026-01-20,ACME CORP PAYROLL,DIRECT_DEPOSIT,2500.00,6623.90,Posted
+"""
+
+
+class BankAccountTests(unittest.TestCase):
+    """Bank exports: flows, months, income offset, and learning from spreadsheet history."""
+
+    def setUp(self):
+        from budget_app.db import set_setting
+        self.tmp = tempfile.mkdtemp()
+        self.db = make_db(self.tmp)
+        db = self.db
+        db.execute("INSERT INTO categories(id, name) VALUES (1, 'House'), (2, 'Utilities'), (3, 'Misc')")
+        # Spreadsheet history covers Jan-Feb 2026: one entry per amount, as the Excel importer creates them.
+        for month, amt, cid in [("2026-01", 1500.0, 1), ("2026-02", 1500.0, 1), ("2026-02", 58.0, 2), ("2026-02", 12.0, 3)]:
+            cur = db.execute("INSERT INTO transactions(date, description, amount, source, budget_month) "
+                             "VALUES (?, ?, ?, 'excel', ?)", (month + "-01", f"x (spreadsheet)", amt, month))
+            db.execute("INSERT INTO splits(transaction_id, category_id, amount) VALUES (?, ?, ?)", (cur.lastrowid, cid, amt))
+        db.execute("INSERT INTO income(month, date, amount, description, source) VALUES "
+                   "('2026-02', '2026-02-01', 2500.0, 'Paycheck (spreadsheet)', 'excel')")
+        set_setting(db, "income_month_offset", "1")   # paychecks fund next month's budget
+        db.commit()
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.tmp)
+
+    def test_classification(self):
+        rows = statement.parse_csv(BANK_CSV)
+        flows = {(r["date"], r["description"]): (r["flow"], r["amount"]) for r in rows}
+        self.assertTrue(all(r["kind"] == "bank" for r in rows))
+        self.assertEqual(flows[("2026-03-14", "ACME CORP PAYROLL")], ("income", 2500.0))
+        self.assertEqual(flows[("2026-03-10", "MORTGAGE CO")], ("spend", 1500.0))
+        self.assertEqual(flows[("2026-02-16", "BIG BANK CC PAY")][0], "card_payment")
+        self.assertEqual(flows[("2026-02-03", "To Checking - 1234")][0], "transfer")
+        self.assertEqual(flows[("2026-02-02", "FRIEND REIMBURSED")], ("credit", -45.0))
+        self.assertEqual(flows[("2026-02-28", "Interest earned")][0], "income")
+
+    def test_import_matches_history_learns_rules_and_adds_new_months(self):
+        res = statement.import_statement(self.db, BANK_CSV, "Joint-Savings.csv")
+        self.assertEqual(res["account"], "Joint Savings")
+        # Jan + Feb mortgage, Feb water, Jan paycheck (-> Feb income) matched to the spreadsheet.
+        self.assertEqual(res["history_matched"], 4)
+        self.assertEqual(res["months"], {"2026-03": 3})        # only March rows are new
+        # A rule is learned only when a merchant consistently went to one envelope (2+ times).
+        self.assertEqual(res["rules_learned"], [{"pattern": "MORTGAGE CO", "category": "House"}])
+        mort = self.db.execute("SELECT * FROM transactions WHERE source = 'statement' AND description = 'MORTGAGE CO'").fetchone()
+        self.assertEqual(mort["budget_month"], "2026-03")
+        self.assertEqual(self.db.execute("SELECT category_id FROM splits WHERE transaction_id = ?", (mort["id"],)).fetchone()[0], 1)
+        # History entries got real names and dates; amounts unchanged.
+        h = self.db.execute("SELECT * FROM transactions WHERE source = 'excel' AND budget_month = '2026-01'").fetchone()
+        self.assertEqual((h["description"], h["date"], h["amount"]), ("MORTGAGE CO", "2026-01-10", 1500.0))
+        # Income: Feb paycheck (in Feb history) -> skipped/matched; Feb interest -> March income; March paycheck -> April.
+        inc = {(r["month"], r["amount"]) for r in self.db.execute("SELECT * FROM income WHERE source = 'statement'")}
+        self.assertEqual(inc, {("2026-03", 2500.0), ("2026-03", 4.1), ("2026-04", 2500.0)})
+        self.assertEqual(self.db.execute("SELECT description FROM income WHERE source = 'excel'").fetchone()[0], "ACME CORP PAYROLL")
+
+        # Re-import: nothing new.
+        again = statement.import_statement(self.db, BANK_CSV, "Joint-Savings.csv")
+        self.assertEqual((again["imported"], len(again["income_added"])), (0, 0))
+
+    def test_same_amount_in_two_envelopes_is_not_guessed(self):
+        db = self.db
+        db.execute("INSERT INTO categories(id, name) VALUES (4, 'Church'), (5, 'Loans')")
+        for cid in (4, 5):   # two $150 entries in different envelopes, same month
+            cur = db.execute("INSERT INTO transactions(date, description, amount, source, budget_month) "
+                             "VALUES ('2026-02-01', 'x (spreadsheet)', 150.0, 'excel', '2026-02')")
+            db.execute("INSERT INTO splits(transaction_id, category_id, amount) VALUES (?, ?, 150.0)", (cur.lastrowid, cid))
+        csv_text = ("Date,Description,Type,Amount,Current balance,Status\n"
+                    "2026-02-05,GIVING CO,DIRECT_PAY,-150.00,100,Posted\n2026-02-15,LOAN SERVICER,DIRECT_PAY,-150.00,100,Posted\n")
+        res = statement.import_statement(db, csv_text, "checking.csv")
+        self.assertEqual(res["history_matched"], 0)          # no clue which is which -> left alone
+        from budget_app.categorize import upsert_rule
+        upsert_rule(db, "LOAN SERVICER", 5)                     # with a clue, the right one is picked
+        statement.import_statement(db, csv_text.replace("100,Posted", "101,Posted"), "checking2.csv")
+        r = db.execute("""SELECT s.category_id FROM transactions t JOIN splits s ON s.transaction_id = t.id
+                          WHERE t.source = 'excel' AND t.description = 'LOAN SERVICER'""").fetchone()
+        self.assertEqual(r[0], 5)
+
+    def test_undo_removes_income(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            app = create_app(data_dir=tmp, testing=True)
+            with app.test_client() as c:
+                r = c.post("/api/import/statement", data={"file": (io.BytesIO(BANK_CSV.encode()), "Joint-Savings.csv")})
+                res = r.get_json()
+                self.assertEqual(res["kind"], "bank")
+                # No spreadsheet here and the default offset (0): every row is new, paychecks count the same month.
+                self.assertEqual(len(c.get("/api/income?month=2026-03").get_json()), 1)
+                self.assertGreater(res["imported"], 0)
+                c.delete(f"/api/import/batches/{res['batch_id']}")
+                self.assertEqual(c.get("/api/income?month=2026-03").get_json(), [])
+            db = connect(os.path.join(tmp, "budget.db"))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0], 0)
+            db.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class LocalModelTests(unittest.TestCase):
     """The Ollama path, with the HTTP call replaced by a fake."""
 

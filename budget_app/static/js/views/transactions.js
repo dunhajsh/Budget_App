@@ -146,6 +146,7 @@ function moreMenu(t) {
       <label class="field">Counts toward budget month<input type="month" name="budget_month" value="${t.budget_month}"></label>
       <label class="field">Note<input name="notes" value="${esc(t.notes || "")}" placeholder="e.g. Birthday gift for Mom"></label>
       <label class="row"><input type="checkbox" name="excluded" ${t.excluded ? "checked" : ""}> Not part of the budget (card payment, transfer, reimbursed)</label>
+      ${t.amount < 0 && t.source === "statement" ? `<div class="small muted">A deposit that's really income (side job, gift)? <button class="small" data-income>Count as income</button></div>` : ""}
     </div>`,
     foot: `${t.source !== "statement" ? `<button class="danger" data-del>Delete</button>` : ""}<span class="spacer"></span>
            <button data-close>Cancel</button><button class="primary" data-save>Save</button>`,
@@ -160,6 +161,13 @@ function moreMenu(t) {
           close(); render();
         } catch (e) { fail(e); }
       };
+      const inc = root.querySelector("[data-income]");
+      if (inc) inc.onclick = async () => {
+        try {
+          const r = await api(`/transactions/${t.id}/to-income`, { method: "POST", body: {} });
+          toast(`Added to ${monthLabel(r.month)} income`); close(); render();
+        } catch (e) { fail(e); }
+      };
       const del = root.querySelector("[data-del]");
       if (del) del.onclick = async () => {
         if (!confirm("Delete this transaction?")) return;
@@ -170,58 +178,123 @@ function moreMenu(t) {
 }
 
 export function importDialog() {
-  const accounts = (state.status.accounts || []).filter((a) => a !== "Spreadsheet");
   modal({
-    title: "Import a statement",
+    title: "Import statements",
+    wide: true,
     body: `<div class="stack">
-      <div class="dropzone" id="dz"><div class="big">📄</div><b>Drop your statement CSV here</b><br>or click to choose a file
-        <input type="file" accept=".csv,text/csv" hidden></div>
-      <div id="preview" class="muted small"></div>
-      <div class="grid grid-2">
-        <label class="field">Account name<input name="account" list="acct" value="${esc(accounts[0] || "Credit Card")}">
-          <datalist id="acct">${accounts.map((a) => `<option value="${esc(a)}">`).join("")}</datalist></label>
-        <label class="field">Counts toward budget month<input type="month" name="budget_month" value="${state.month}"></label>
-      </div>
-      <p class="small muted" style="margin:0">Re-importing the same file is safe - duplicates are skipped. Card payments are detected and left out of the budget.
-        Most banks have a "Download transactions → CSV" option; SoFi, Chase, Capital One, Discover, Citi and Amex formats are recognized.</p>
+      <div class="dropzone" id="dz"><div class="big">📄</div><b>Drop card statements or bank account CSVs here</b><br>or click to choose · several at once is fine
+        <input type="file" accept=".csv,text/csv" multiple hidden></div>
+      <div id="files"></div>
+      <p class="small muted" style="margin:0">Re-importing the same file is safe - duplicates are skipped.
+        <b>Card statements</b> count toward the statement's month. <b>Bank accounts</b>: bills count in the month they're paid, paychecks and interest go to
+        income, transfers between your accounts and card payments are left out, other deposits (refunds, reimbursements) show up as credits to categorize.
+        Months your spreadsheet already covers aren't added again; they're used to put merchant names on that history and to learn your categories.</p>
     </div>`,
     foot: `<button data-close>Cancel</button><button class="primary" data-go disabled>Import</button>`,
     onMount(root, close) {
-      let file = null;
+      const files = [];
       const dz = root.querySelector("#dz");
       const input = dz.querySelector("input");
-      const pick = async (f) => {
-        file = f;
-        const fd = new FormData();
-        fd.append("file", f);
-        try {
-          const p = await api("/import/statement/preview", { method: "POST", form: fd });
-          root.querySelector("#preview").innerHTML = `<b>${esc(f.name)}</b>: ${p.count} transactions from ${p.first} to ${p.last},
-            ${money(p.total_spent)} of spending${p.payments ? `, ${p.payments} card payment(s) skipped` : ""}.`;
-          root.querySelector("[name=budget_month]").value = p.budget_month;
-          root.querySelector("[data-go]").disabled = false;
-        } catch (e) { root.querySelector("#preview").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+      const list = root.querySelector("#files");
+      const draw = () => {
+        list.innerHTML = files.length ? `<div class="table-wrap"><table><thead><tr><th>File</th><th>What's in it</th><th>Account</th><th>Budget month</th></tr></thead><tbody>
+          ${files.map((f, i) => {
+            const p = f.p;
+            if (!p) return `<tr><td>${esc(f.file.name)}</td><td colspan="3">${f.err ? `<span class="bad">${esc(f.err)}</span>` : `<span class="spinner"></span>`}</td></tr>`;
+            const bits = [`${p.count} rows, ${p.first} → ${p.last}`];
+            if (p.kind === "bank") {
+              if (p.income) bits.push(`${p.income} paycheck/interest`);
+              if (p.credits) bits.push(`${p.credits} other deposits`);
+              if (p.transfers + p.payments) bits.push(`${p.transfers + p.payments} transfers/card payments left out`);
+            } else if (p.payments) bits.push(`${p.payments} card payment(s) left out`);
+            if (p.in_history) bits.push(`<span class="accent">${p.in_history} in months your spreadsheet covers (through ${monthLabel(p.history_through, true)}) - used to learn, not added</span>`);
+            return `<tr><td><b>${esc(f.file.name)}</b><div class="small muted">${p.kind === "bank" ? "🏦 Bank account" : "💳 Card statement"}</div></td>
+              <td class="small">${bits.join(" · ")}</td>
+              <td><input data-acct="${i}" value="${esc(f.account)}" list="acct" style="width:170px"></td>
+              <td>${p.kind === "bank" ? `<span class="small muted">Each row's own month</span>` : `<input type="month" data-month="${i}" value="${f.month}">`}</td></tr>`;
+          }).join("")}</tbody></table></div>
+          <datalist id="acct">${(state.status.accounts || []).filter((a) => a !== "Spreadsheet").map((a) => `<option value="${esc(a)}">`).join("")}</datalist>` : "";
+        list.querySelectorAll("[data-acct]").forEach((x) => (x.oninput = () => { files[+x.dataset.acct].account = x.value; }));
+        list.querySelectorAll("[data-month]").forEach((x) => (x.oninput = () => { files[+x.dataset.month].month = x.value; }));
+        root.querySelector("[data-go]").disabled = !files.some((f) => f.p);
+      };
+      const add = async (picked) => {
+        for (const file of picked) {
+          const f = { file };
+          files.push(f);
+          draw();
+          const fd = new FormData();
+          fd.append("file", file);
+          try {
+            f.p = await api("/import/statement/preview", { method: "POST", form: fd });
+            f.account = f.p.account;
+            f.month = f.p.budget_month;
+          } catch (e) { f.err = e.message; }
+          draw();
+        }
       };
       dz.onclick = () => input.click();
-      input.onchange = () => input.files[0] && pick(input.files[0]);
+      input.onchange = () => add([...input.files]);
       dz.ondragover = (e) => { e.preventDefault(); dz.classList.add("drag"); };
       dz.ondragleave = () => dz.classList.remove("drag");
-      dz.ondrop = (e) => { e.preventDefault(); dz.classList.remove("drag"); e.dataTransfer.files[0] && pick(e.dataTransfer.files[0]); };
+      dz.ondrop = (e) => { e.preventDefault(); dz.classList.remove("drag"); add([...e.dataTransfer.files]); };
       root.querySelector("[data-go]").onclick = async (ev) => {
         ev.target.disabled = true;
         ev.target.innerHTML = `<span class="spinner"></span> Importing`;
-        const fd = new FormData();
-        fd.append("file", file);
-        fd.append("account", root.querySelector("[name=account]").value);
-        fd.append("budget_month", root.querySelector("[name=budget_month]").value);
+        // Card statements first, oldest first: what's learned from older files helps the newer ones.
+        const todo = files.filter((f) => f.p).sort((a, b) => (a.p.kind === b.p.kind ? (a.p.first < b.p.first ? -1 : 1) : a.p.kind === "card" ? -1 : 1));
+        const results = [];
         try {
-          const r = await api("/import/statement", { method: "POST", form: fd });
-          close();
-          toast(`Imported ${r.imported} transactions (${r.auto_categorized} auto-categorized${r.duplicates ? `, ${r.duplicates} duplicates skipped` : ""})`);
-          if (r.budget_month && r.budget_month !== state.month) { state.month = r.budget_month; localStorage.setItem("month", r.budget_month); }
-          location.hash = "#/transactions?filter=uncategorized";
-          render();
-        } catch (e) { fail(e); ev.target.disabled = false; ev.target.textContent = "Import"; }
+          for (const f of todo) {
+            const fd = new FormData();
+            fd.append("file", f.file);
+            fd.append("account", f.account || "");
+            if (f.p.kind === "card") fd.append("budget_month", f.month);
+            results.push({ name: f.file.name, ...(await api("/import/statement", { method: "POST", form: fd })) });
+          }
+        } catch (e) { fail(e); }
+        close();
+        if (results.length) showResults(results);
+        render();
+      };
+    },
+  });
+}
+
+function showResults(results) {
+  const sum = (k) => results.reduce((a, r) => a + (r[k] || 0), 0);
+  const income = results.flatMap((r) => r.income_added || []);
+  const rules = results.flatMap((r) => r.rules_learned || []);
+  const months = {};
+  results.forEach((r) => Object.entries(r.months || (r.kind === "card" && r.imported ? { [r.budget_month]: r.imported } : {}))
+    .forEach(([m, n]) => (months[m] = (months[m] || 0) + n)));
+  const incByMonth = {};
+  income.forEach((i) => (incByMonth[i.month] = (incByMonth[i.month] || 0) + i.amount));
+  modal({
+    title: "Import finished",
+    body: `<div class="stack">
+      <div class="kpis">
+        <div class="kpi"><div class="label">New transactions</div><div class="value">${sum("imported")}</div>
+          <div class="sub">${Object.entries(months).sort().map(([m, n]) => `${monthLabel(m, true)}: ${n}`).join(" · ") || "-"}</div></div>
+        <div class="kpi"><div class="label">Auto-categorized</div><div class="value">${sum("auto_categorized")}</div><div class="sub">${sum("left_out")} transfers/payments left out</div></div>
+        <div class="kpi"><div class="label">Income added</div><div class="value">${money(income.reduce((a, i) => a + i.amount, 0))}</div>
+          <div class="sub">${Object.entries(incByMonth).sort().map(([m, a]) => `${monthLabel(m, true)}: ${money(a)}`).join(" · ") || "-"}</div></div>
+        <div class="kpi"><div class="label">History matched</div><div class="value">${sum("history_matched")}</div><div class="sub">spreadsheet entries now have merchant names</div></div>
+      </div>
+      ${rules.length ? `<div><b>Learned ${rules.length} merchant rules from your spreadsheet history</b>${sum("recategorized") ? ` (and re-sorted ${sum("recategorized")} unreviewed transactions)` : ""}:
+        <div class="small muted" style="margin-top:4px;columns:2">${rules.map((r) => `${esc(r.pattern)} → ${esc(r.category)}`).join("<br>")}</div></div>` : ""}
+      ${sum("duplicates") ? `<div class="small muted">${sum("duplicates")} rows were already imported and were skipped.</div>` : ""}
+      ${sum("history_skipped") ? `<div class="small muted">${sum("history_skipped")} rows fall in months your spreadsheet already covers but didn't match an entry there (e.g. card payments, transfers, or entries you combined) - they weren't added.</div>` : ""}
+      <table class="small">${results.map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.account || "")}</td><td class="num">${r.imported} new</td><td class="num">${r.history_matched} matched to history</td></tr>`).join("")}</table>
+    </div>`,
+    foot: `<button data-close>Close</button><button class="primary" data-go>Review new transactions</button>`,
+    onMount(root, close) {
+      root.querySelector("[data-go]").onclick = () => {
+        const latest = Object.keys(months).sort().pop();
+        if (latest && latest !== state.month) { state.month = latest; localStorage.setItem("month", latest); }
+        close();
+        location.hash = "#/transactions?filter=uncategorized";
+        render();
       };
     },
   });

@@ -6,6 +6,7 @@ A local envelope-budgeting app that replaces a yearly Excel budget. It runs on y
 - **Imports card statements (CSV)**: purchases are sorted automatically by merchant rules that learn as you categorize ("Always put *Ulta* in *Beauty*?"). Card payments are recognized and left out of the budget.
 - **Receipts**: drop in photos, PDFs or pasted email receipts. AI (a free local model through Ollama, or Claude) reads every line item, sorts each into an envelope/subcategory, finds the matching card charge, and splits that charge (tax spread proportionally). One $180 Meijer charge becomes Groceries › Produce, Toiletries, House › Household Supplies, …
 - **Amazon**: import your Amazon order history. Each shipment is matched to its card charge and split by item.
+- **Email receipts**: connect Gmail/Outlook/IMAP mailboxes (read-only). Order confirmations and digital receipts are found, read, matched to card charges and split, with no typing.
 - **Envelope budgeting**: income, monthly amounts per envelope ("Fill with usual amounts" / "Copy last month"), carry-over, overspending alerts.
 - **Recurring bills**: mortgage, car payment, giving, loans. Add them to a month with one click (suggestions come from your history).
 - **Reports**: income vs. spending trends, a year grid like the old spreadsheet, envelope drill-downs, top receipt items, and Excel export.
@@ -47,9 +48,19 @@ Neither Meijer nor Amazon offers a public API for personal purchase history, and
 | **Meijer** | Meijer app → *Purchases* (mPerks digital receipts) → open a receipt → screenshot it, or save the emailed Meijer.com order receipt as PDF. Drop it on **Receipts**. |
 | **Anything else** | Photo of the paper receipt, PDF, or paste the text of an emailed receipt. |
 
+### Email receipts
+
+**Settings → Email** connects mailboxes; **Receipts → Check email** scans them in the background.
+
+- **Gmail**: needs 2-Step Verification and an [app password](https://myaccount.google.com/apppasswords). The app searches Gmail's *Purchases* category plus anything labeled *Receipts* (editable; any Gmail search works).
+- **Outlook.com / Hotmail**: Microsoft has turned off app-password sign-in for many personal accounts. If it's refused, add an Outlook rule that forwards receipt emails to a Gmail account, and label them *Receipts* there.
+- **Other mail**: any IMAP server; one folder, filtered to purchase-like subjects.
+
+It is read-only (nothing is marked read, moved or deleted). App passwords are kept in the operating system's credential store (Windows Credential Manager), not in the database. Shipping notices and ads are skipped; a second email for the same order is recognized as a duplicate. Every email checked is listed under **Settings → Email**, with *Read again* for anything wrongly skipped. Note: some workplace networks block mail ports (993); scan from home if the connection fails.
+
 ## Data & privacy
 - Everything is stored in `data/budget.db` (plus receipt images in `data/receipts/`). `data/` is git-ignored, so no financial data ever goes into the repository. Back it up from **Settings → Import & data → Download backup**.
-- With the local (Ollama) option, receipts never leave your computer. With Claude, images and text are sent to Anthropic only when you upload a receipt or click *Suggest categories*. The API key is stored in the local database.
+- With the local (Ollama) option, receipts and emails never leave your computer. With Claude, images and text are sent to Anthropic only when you upload a receipt or click *Suggest categories*. The API key is stored in the local database.
 
 ## Development
 
@@ -66,12 +77,12 @@ budget_app/
   categorize.py       merchant normalization + rules
   receipts.py         receipt matching and tax-aware splitting
   ai.py               AI calls via Claude or local Ollama (receipt reading, categorization)
+  emailscan.py        IMAP mailbox scanning for emailed receipts
   importers/          excel.py · statement.py · amazon.py
   static/, templates/ single-page front end (vanilla JS + Chart.js)
 ```
 
 ### Ideas for later
 - Automatic bank/card feeds via Plaid or SimpleFIN (no more CSV downloads).
-- Forward emailed receipts to a mailbox the app reads.
 - Browser extension that captures Amazon/Meijer order pages while you're logged in.
 - Savings goals and sinking funds with target dates.

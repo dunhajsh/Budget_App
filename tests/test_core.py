@@ -303,6 +303,126 @@ class LocalModelTests(unittest.TestCase):
         self.assertIn("SUBTOTAL 5.00", msg["content"])
 
 
+def make_email(subject, html, msg_id, sent="Mon, 13 Oct 2026 10:00:00 -0400", sender="Store <orders@example.com>"):
+    from email.message import EmailMessage
+    m = EmailMessage()
+    m["Subject"], m["From"], m["To"], m["Date"], m["Message-ID"] = subject, sender, "me@example.com", sent, msg_id
+    m.set_content("See the HTML version.")
+    m.add_alternative(html, subtype="html")
+    return m.as_bytes()
+
+
+class FakeIMAP:
+    """Just enough of imaplib.IMAP4 for the scanner."""
+
+    def __init__(self, messages):
+        self.messages = messages  # {uid: raw bytes}
+        self.fetched_bodies = []
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"', b'(\\HasNoChildren) "/" "INBOX"']
+
+    def select(self, name, readonly=False):
+        assert readonly
+        return "OK", [str(len(self.messages)).encode()]
+
+    def uid(self, cmd, *args):
+        if cmd == "SEARCH":
+            return "OK", [" ".join(str(u) for u in sorted(self.messages)).encode()]
+        uids, spec = args
+        out = []
+        for u in uids.split(","):
+            raw = self.messages[int(u)]
+            if "HEADER.FIELDS" in spec:
+                raw = raw.split(b"\n\n", 1)[0].split(b"\r\n\r\n", 1)[0]
+            else:
+                self.fetched_bodies.append(int(u))
+            out += [(f"{u} (UID {u} BODY[] {{{len(raw)}}}".encode(), raw), b")"]
+        return "OK", out
+
+
+class EmailScanTests(unittest.TestCase):
+    def setUp(self):
+        from budget_app import emailscan
+        self.es = emailscan
+        self.tmp = tempfile.mkdtemp()
+        self.db = make_db(self.tmp)
+        self.db.execute("INSERT INTO categories(id, name) VALUES (1, 'Groceries'), (2, 'Household')")
+        self.db.execute("INSERT INTO email_accounts(id, address, provider, host, search, since) "
+                        "VALUES (1, 'me@example.com', 'gmail', 'imap.example.com', 'category:purchases', '2026-10-01')")
+        self.db.execute("INSERT INTO transactions(date, description, amount, source, budget_month) "
+                        "VALUES ('2026-10-14', 'FRESH MART #12', 25.00, 'statement', '2026-10')")
+        self.db.commit()
+        self.acct = dict(self.db.execute("SELECT * FROM email_accounts").fetchone())
+        self.ai_calls = []
+        self._orig = emailscan.ai.parse_receipt
+
+        def fake_parse(db, text=None, email=None, attachments=(), **kw):
+            self.ai_calls.append(email["subject"])
+            if "Newsletter" in email["subject"]:
+                return {"is_receipt": False, "order_number": "", "merchant": "", "purchase_date": "", "subtotal": 0,
+                        "tax": 0, "total": 0, "card_last4": "", "items": []}
+            assert "Bananas" in text and "25.00" in text
+            return {"is_receipt": True, "order_number": "A-12345", "merchant": "Fresh Mart", "purchase_date": "2026-10-13",
+                    "subtotal": 24.0, "tax": 1.0, "total": 25.0, "card_last4": "",
+                    "items": [{"name": "Bananas", "quantity": 1, "amount": 4.0, "taxable": False, "category_id": 1},
+                              {"name": "Dish soap", "quantity": 1, "amount": 20.0, "taxable": True, "category_id": 2}]}
+        emailscan.ai.parse_receipt = fake_parse
+        receipt_html = ("<html><head><style>.x{}</style></head><body><h1>Thanks for your order A-12345</h1><table>"
+                        "<tr><td>Bananas</td><td>$4.00</td></tr><tr><td>Dish soap</td><td>$20.00</td></tr>"
+                        "<tr><td>Total</td><td>$25.00</td></tr></table></body></html>")
+        self.imap = FakeIMAP({
+            1: make_email("Your Fresh Mart order A-12345", receipt_html, "<a@x>"),
+            2: make_email("Your package has shipped!", "<p>On its way. $25.00</p>", "<b@x>"),
+            3: make_email("Weekly Newsletter: deals", "<p>Steaks $9.99/lb</p>", "<c@x>"),
+            4: make_email("Receipt for order A-12345", receipt_html, "<d@x>"),
+        })
+
+    def tearDown(self):
+        self.es.ai.parse_receipt = self._orig
+        self.db.close()
+        shutil.rmtree(self.tmp)
+
+    def test_html_to_text(self):
+        t = self.es.html_to_text("<style>p{color:red}</style><table><tr><td>Milk</td><td>$3.49</td></tr>"
+                                 "<tr><td>Eggs &amp; ham</td><td>$5.00</td></tr></table>")
+        self.assertNotIn("color", t)
+        self.assertEqual(t.splitlines(), ["Milk | $3.49", "Eggs & ham | $5.00"])
+
+    def test_scan_finds_receipt_matches_charge_and_skips_the_rest(self):
+        c = self.es.scan_account(self.db, self.acct, "pw", self.tmp, imap=self.imap)
+        self.assertEqual(c["receipts"], 1)
+        self.assertEqual(c["duplicates"], 1)   # second email for the same order
+        self.assertEqual(c["skipped"], 2)      # shipped (by subject, no AI) + newsletter (AI said no)
+        self.assertNotIn("Your package has shipped!", self.ai_calls)
+        self.assertNotIn(2, self.imap.fetched_bodies)
+        r = self.db.execute("SELECT * FROM receipts").fetchone()
+        self.assertEqual((r["source"], r["merchant"], r["total"]), ("email", "Fresh Mart", 25.0))
+        t = self.db.execute("SELECT id FROM transactions").fetchone()
+        self.assertEqual(r["transaction_id"], t["id"])   # matched to the card charge
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM receipt_items").fetchone()[0], 2)
+        # The original email text is kept so the receipt can be re-read.
+        self.assertIn("Bananas", json.loads(r["raw_json"])["text"])
+
+        # A second scan reads nothing again.
+        n = len(self.ai_calls)
+        c2 = self.es.scan_account(self.db, self.acct, "pw", self.tmp, imap=self.imap)
+        self.assertEqual(len(self.ai_calls), n)
+        self.assertEqual(c2["receipts"] + c2["skipped"] + c2["duplicates"], 0)
+
+    def test_read_again_bypasses_subject_filter(self):
+        self.es.scan_account(self.db, self.acct, "pw", self.tmp, imap=self.imap)
+        self.db.execute("UPDATE email_seen SET status = 'retry' WHERE message_id = '<b@x>'")
+        self.es.scan_account(self.db, self.acct, "pw", self.tmp, imap=self.imap)
+        self.assertIn(2, self.imap.fetched_bodies)
+
+    def test_non_gmail_requires_purchase_subject(self):
+        acct = dict(self.acct, provider="outlook", search=None)
+        self.assertEqual(self.es.screen(acct, {"subject": "Lunch on Friday?"}), "Subject doesn't look like a purchase")
+        self.assertIsNone(self.es.screen(acct, {"subject": "Your Target.com order #1234"}))
+        self.assertIsNone(self.es.screen(self.acct, {"subject": "Lunch on Friday?"}))  # Gmail search already filtered
+
+
 class ApiSmokeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

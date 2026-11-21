@@ -141,11 +141,40 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Mailboxes scanned for emailed receipts. Passwords live in the OS credential store, not here.
+CREATE TABLE IF NOT EXISTS email_accounts (
+    id           INTEGER PRIMARY KEY,
+    address      TEXT NOT NULL UNIQUE,
+    provider     TEXT NOT NULL DEFAULT 'gmail',   -- gmail | outlook | other
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL DEFAULT 993,
+    folder       TEXT NOT NULL DEFAULT 'INBOX',
+    search       TEXT,                            -- Gmail search, e.g. category:purchases
+    since        TEXT NOT NULL,                   -- only emails on/after this date
+    active       INTEGER NOT NULL DEFAULT 1,
+    last_checked TEXT,
+    last_error   TEXT
+);
+
+-- Every email looked at, so nothing is read twice.
+CREATE TABLE IF NOT EXISTS email_seen (
+    account_id  INTEGER NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
+    message_id  TEXT NOT NULL,
+    sent_at     TEXT,
+    sender      TEXT,
+    subject     TEXT,
+    status      TEXT NOT NULL,       -- receipt | skipped | duplicate | error
+    reason      TEXT,
+    receipt_id  INTEGER REFERENCES receipts(id) ON DELETE SET NULL,
+    seen_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (account_id, message_id)
+);
 """
 
 
 def connect(path):
-    conn = sqlite3.connect(path, detect_types=0)
+    conn = sqlite3.connect(path, detect_types=0, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn

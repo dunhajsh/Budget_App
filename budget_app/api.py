@@ -9,7 +9,7 @@ from datetime import date, datetime
 from flask import Blueprint, abort, current_app, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
-from . import ai, receipts
+from . import ai, emailscan, receipts
 from .budget import categories_tree, history, month_add, month_summary
 from .categorize import (apply_rules_to_uncategorized, find_category, merchant_key, set_single_category,
                          upsert_rule)
@@ -832,16 +832,16 @@ def reparse_receipt(rid):
     r = db.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
     if not r:
         abort(404)
+    src = receipts.source_of(db, rid)
+    data = mt = None
     if r["stored_path"]:
         path = os.path.join(current_app.config["RECEIPT_DIR"], os.path.basename(r["stored_path"]))
         ext = os.path.splitext(path)[1].lower()
-        ok = receipts.run_parse(db, rid, data=open(path, "rb").read(),
-                                media_type="application/pdf" if ext == ".pdf" else mimetypes.guess_type(path)[0])
-    else:
-        text = json.loads(r["raw_json"] or "{}").get("text")
-        if not text:
-            raise ValueError("Nothing to re-read for this receipt")
-        ok = receipts.run_parse(db, rid, text=text)
+        data = open(path, "rb").read()
+        mt = "application/pdf" if ext == ".pdf" else mimetypes.guess_type(path)[0]
+    if data is None and not src["text"]:
+        raise ValueError("Nothing to re-read for this receipt")
+    ok = receipts.run_parse(db, rid, data=data, media_type=mt, text=src["text"], email=src["email"])
     if ok and not r["transaction_id"]:
         m = receipts.best_match(db, rid)
         if m:
@@ -940,3 +940,138 @@ def backup():
         os.remove(path)
     db.execute("VACUUM INTO ?", (path,))
     return send_file(path, as_attachment=True, download_name=f"budget_backup_{date.today().isoformat()}.db")
+
+
+# ------------------------------------------------------------------ email receipts
+
+def _default_since():
+    first = date.today().replace(day=1)
+    return month_add(first.strftime("%Y-%m"), -1) + "-01"
+
+
+@bp.get("/email/accounts")
+def email_accounts():
+    db = get_db()
+    return jsonify([emailscan.account_dict(db, a) for a in db.execute("SELECT * FROM email_accounts ORDER BY id")])
+
+
+@bp.post("/email/accounts")
+def add_email_account():
+    db = get_db()
+    b = _body()
+    address = (b.get("address") or "").strip().lower()
+    password = (b.get("password") or "").replace(" ", "") if b.get("provider") == "gmail" else (b.get("password") or "").strip()
+    provider = b.get("provider") or ("gmail" if address.endswith(("@gmail.com", "@googlemail.com")) else "other")
+    if "@" not in address or not password:
+        raise ValueError("Enter the email address and its app password")
+    if provider not in emailscan.PRESETS:
+        raise ValueError("Unknown provider")
+    preset = emailscan.PRESETS[provider]
+    acct = {
+        "address": address, "provider": provider,
+        "host": (b.get("host") or preset["host"]).strip(), "port": int(b.get("port") or preset["port"]),
+        "folder": (b.get("folder") or preset["folder"]).strip(),
+        "search": (b.get("search") if b.get("search") is not None else preset["search"]) or None,
+        "since": b.get("since") or _default_since(),
+    }
+    if not acct["host"]:
+        raise ValueError("Enter the IMAP server name")
+    date.fromisoformat(acct["since"])
+    try:
+        emailscan.login(acct, password).logout()   # make sure it works before saving anything
+        emailscan.set_password(address, password)
+    except emailscan.EmailError as e:
+        return jsonify(error=str(e)), 400
+    db.execute(
+        """INSERT INTO email_accounts(address, provider, host, port, folder, search, since) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(address) DO UPDATE SET provider = excluded.provider, host = excluded.host, port = excluded.port,
+               folder = excluded.folder, search = excluded.search, since = excluded.since, active = 1, last_error = NULL""",
+        (acct["address"], acct["provider"], acct["host"], acct["port"], acct["folder"], acct["search"], acct["since"]),
+    )
+    db.commit()
+    return email_accounts()
+
+
+@bp.patch("/email/accounts/<int:aid>")
+def update_email_account(aid):
+    db = get_db()
+    a = db.execute("SELECT * FROM email_accounts WHERE id = ?", (aid,)).fetchone()
+    if not a:
+        abort(404)
+    b = _body()
+    for k in ("folder", "search", "since", "active"):
+        if k in b:
+            if k == "since":
+                date.fromisoformat(b[k])
+            db.execute(f"UPDATE email_accounts SET {k} = ? WHERE id = ?", (b[k], aid))
+    if b.get("password"):
+        pw = b["password"].replace(" ", "") if a["provider"] == "gmail" else b["password"].strip()
+        try:
+            emailscan.login(dict(a), pw).logout()
+            emailscan.set_password(a["address"], pw)
+        except emailscan.EmailError as e:
+            return jsonify(error=str(e)), 400
+        db.execute("UPDATE email_accounts SET last_error = NULL WHERE id = ?", (aid,))
+    db.commit()
+    return email_accounts()
+
+
+@bp.delete("/email/accounts/<int:aid>")
+def delete_email_account(aid):
+    db = get_db()
+    a = db.execute("SELECT address FROM email_accounts WHERE id = ?", (aid,)).fetchone()
+    if a:
+        emailscan.delete_password(a["address"])
+        db.execute("DELETE FROM email_accounts WHERE id = ?", (aid,))
+        db.commit()
+    return email_accounts()
+
+
+@bp.get("/email/scan")
+def email_scan_status():
+    return jsonify(emailscan.JOB.status())
+
+
+@bp.post("/email/scan")
+def email_scan_start():
+    db = get_db()
+    if not ai.enabled(db):
+        raise ValueError("Turn on AI first (Settings → AI & receipts) - it's what reads the emails.")
+    if not db.execute("SELECT 1 FROM email_accounts WHERE active = 1").fetchone():
+        raise ValueError("Add an email account first (Settings → Email).")
+    ids = _body().get("account_ids")
+    try:
+        emailscan.JOB.start(current_app.config["DATABASE"], current_app.config["RECEIPT_DIR"], ids)
+    except emailscan.EmailError as e:
+        return jsonify(error=str(e)), 409
+    return jsonify(emailscan.JOB.status())
+
+
+@bp.post("/email/scan/cancel")
+def email_scan_cancel():
+    emailscan.JOB.cancel()
+    return jsonify(emailscan.JOB.status())
+
+
+@bp.get("/email/seen")
+def email_seen():
+    db = get_db()
+    st = request.args.get("status")
+    q = """SELECT s.*, a.address FROM email_seen s JOIN email_accounts a ON a.id = s.account_id"""
+    args = []
+    if st:
+        q += " WHERE s.status = ?"
+        args.append(st)
+    q += " ORDER BY s.sent_at DESC, s.seen_at DESC LIMIT 300"
+    return jsonify(rows(db.execute(q, args)))
+
+
+@bp.post("/email/seen/retry")
+def email_seen_retry():
+    """Forget that an email was looked at, so the next scan reads it (even if the subject filter skipped it)."""
+    db = get_db()
+    b = _body()
+    db.execute("UPDATE email_seen SET status = 'retry' WHERE account_id = ? AND message_id = ?",
+               (b.get("account_id"), b.get("message_id")))
+    db.commit()
+    return jsonify(ok=True)

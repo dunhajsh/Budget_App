@@ -1,4 +1,5 @@
 import { api, catOptions, esc, fail, hashParams, modal, money, render, state, toast } from "../app.js";
+import { scanPanel } from "./email.js";
 
 const STATUS = {
   pending: ["Reading…", "accent"],
@@ -9,7 +10,7 @@ const STATUS = {
 
 function card(r) {
   const [label, cls] = STATUS[r.status] || [r.status, ""];
-  const icon = r.source === "amazon" ? "📦" : r.source === "text" ? "📝" : "🧾";
+  const icon = r.source === "amazon" ? "📦" : r.source === "text" ? "📝" : r.source === "email" ? "✉️" : "🧾";
   const match = r.transaction_id
     ? `<div class="small muted">↔ ${esc(r.txn_description)} · ${money(r.txn_amount)}</div>`
     : `<div class="small warn">Not matched to a card charge yet</div>`;
@@ -31,7 +32,10 @@ export async function openReceipt(id) {
     ? (r.stored_path.toLowerCase().endsWith(".pdf")
       ? `<iframe src="/api/receipts/${r.id}/file"></iframe>`
       : `<a href="/api/receipts/${r.id}/file" target="_blank"><img src="/api/receipts/${r.id}/file" alt="receipt"></a>`)
-    : `<div class="empty">${r.source === "amazon" ? "📦<br>Imported from your Amazon order history" : "📝<br>Entered as text"}</div>`;
+    : r.source === "email" && r.email
+      ? `<div class="email-src"><div class="small muted">✉️ ${esc(r.email.sender || "")} · ${esc(r.email.date || "")}${r.email.account ? ` · to ${esc(r.email.account)}` : ""}</div>
+          <b>${esc(r.email.subject || "")}</b><pre>${esc(r.source_text || "")}</pre></div>`
+      : `<div class="empty">${r.source === "amazon" ? "📦<br>Imported from your Amazon order history" : "📝<br>Entered as text"}</div>`;
 
   const candHtml = (cands) => cands.length
     ? cands.map((c) => `<div class="cand ${c.id === chosen ? "sel" : ""}" data-cand="${c.id}">
@@ -69,7 +73,7 @@ export async function openReceipt(id) {
         </div>
       </div></div>`,
     foot: `<button class="danger" data-delete>Delete</button>
-      ${r.stored_path || r.source === "text" ? `<button data-reparse ${state.status.ai_enabled ? "" : "disabled title='Turn on AI in Settings'"}>✨ Re-read</button>` : ""}
+      ${r.stored_path || r.source === "text" || r.source === "email" ? `<button data-reparse ${state.status.ai_enabled ? "" : "disabled title='Turn on AI in Settings'"}>✨ Re-read</button>` : ""}
       <span class="spacer"></span>
       <button data-cash>Record as cash/debit</button>
       <button data-save>Save</button>
@@ -248,6 +252,7 @@ export default {
         <div class="stack">
           <button style="width:100%;justify-content:center" data-amazon>📦 Import Amazon orders</button>
           <button style="width:100%;justify-content:center" data-text>📝 Paste receipt text</button>
+          <div id="email-scan"></div>
           <div class="small muted">Meijer: open the Meijer app → <i>Purchases</i> → a receipt → screenshot it, or save the emailed receipt as PDF.</div>
         </div>
       </div>
@@ -283,6 +288,7 @@ export default {
       textDialog();
     };
     el.querySelectorAll("[data-open]").forEach((c) => (c.onclick = () => openReceipt(+c.dataset.open)));
+    scanPanel(el.querySelector("#email-scan"), alive).catch(() => {});
     const want = hashParams().get("open");
     if (want) { history.replaceState(null, "", "#/receipts"); openReceipt(+want); }
   },

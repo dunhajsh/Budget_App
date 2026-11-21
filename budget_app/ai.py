@@ -329,38 +329,66 @@ def _clean_receipt(res):
     return res
 
 
-def parse_receipt(db, data=None, media_type=None, text=None):
+EMAIL_SCHEMA = {
+    **RECEIPT_SCHEMA,
+    "properties": {
+        "is_receipt": {"type": "boolean", "description": "True only if this email confirms a purchase with prices"},
+        "order_number": {"type": "string", "description": "Order/confirmation number, or empty"},
+        **RECEIPT_SCHEMA["properties"],
+    },
+    "required": ["is_receipt", "order_number"] + RECEIPT_SCHEMA["required"],
+}
+
+EMAIL_SYSTEM = RECEIPT_SYSTEM + """
+
+You are reading an email (and any attachments). First decide `is_receipt`:
+- true for order confirmations, digital receipts, invoices and payment receipts that list what was bought and what it cost.
+- false for shipping/delivery updates without prices, ads, sales and coupons, newsletters, account notices, surveys, and refunds.
+When `is_receipt` is false, return empty strings, zeros and an empty item list.
+For an order with several items, the `total` is the order total that was charged."""
+
+
+def _file_blocks(data, media_type, local):
+    if media_type == "application/pdf":
+        if local:
+            return _pdf_for_local(data)
+        return [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                "data": base64.standard_b64encode(data).decode()}}]
+    # Local vision models get a smaller image: faster, and it fits in a laptop GPU.
+    return [_image_block(data, media_type, max_side=2048 if local else 3000)]
+
+
+def parse_receipt(db, data=None, media_type=None, text=None, email=None, attachments=()):
+    """Read one receipt. `email` (dict with subject/sender/date) switches to email mode, where the
+    model may also say the message isn't a receipt; `attachments` is a list of (bytes, media_type)."""
     local = provider(db) == "ollama"
     content = []
-    if text:
+    if email:
+        head = f"Email from: {email.get('sender', '')}\nSubject: {email.get('subject', '')}\nDate: {email.get('date', '')}"
+        content.append({"type": "text", "text": head + "\n\n" + (text or "(no text body)")})
+    elif text:
         content.append({"type": "text", "text": "Receipt text:\n\n" + text})
-    elif media_type == "application/pdf":
-        if local:
-            content.extend(_pdf_for_local(data))
-        else:
-            content.append(
-                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                 "data": base64.standard_b64encode(data).decode()}}
-            )
-    else:
-        # Local vision models get a smaller image: faster, and it fits in a laptop GPU.
-        content.append(_image_block(data, media_type, max_side=2048 if local else 3000))
+    if data is not None:
+        content.extend(_file_blocks(data, media_type, local))
+    for adata, amt in attachments:
+        content.extend(_file_blocks(adata, amt, local))
     prompt = "Categories (id: name):\n" + category_lines(db)
     g = _guidance(db)
     if g:
         prompt += "\n\n" + g
-    prompt += "\n\nExtract this receipt."
+    prompt += "\n\nRead this email." if email else "\n\nExtract this receipt."
     content.append({"type": "text", "text": prompt})
+    schema, system = (EMAIL_SCHEMA, EMAIL_SYSTEM) if email else (RECEIPT_SCHEMA, RECEIPT_SYSTEM)
 
     if not local:
-        return _clean_receipt(_call(db, content, RECEIPT_SCHEMA, RECEIPT_SYSTEM, effort="medium"))
+        return _clean_receipt(_call(db, content, schema, system, effort="medium"))
 
     # Small local models: a quick pass first; if the items or tax don't add up, read it again
     # carefully with thinking on (slower, but catches missed lines like coupons).
     mode = get_setting(db, "ollama_think") or "auto"
-    res = _call(db, content, RECEIPT_SCHEMA, RECEIPT_SYSTEM, think=(mode == "always"))
-    if mode == "auto" and not _looks_right(res):
-        res = _call(db, content, RECEIPT_SCHEMA, RECEIPT_SYSTEM, think=True)
+    res = _call(db, content, schema, system, think=(mode == "always"))
+    if mode == "auto" and res.get("is_receipt", True) and not _looks_right(res):
+        res = _call(db, content, schema, system, think=True)
     return _clean_receipt(res)
 
 

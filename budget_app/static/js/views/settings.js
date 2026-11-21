@@ -1,9 +1,10 @@
 import { api, catOptions, esc, fail, hashParams, loadCategories, money, refreshStatus, render, state, toast } from "../app.js";
 import { importDialog } from "./transactions.js";
+import { emailTab } from "./email.js";
 
 const TABS = [
   ["import", "Import & data"], ["categories", "Categories"], ["rules", "Merchant rules"],
-  ["cardmap", "Card categories"], ["recurring", "Recurring bills"], ["ai", "AI & receipts"],
+  ["cardmap", "Card categories"], ["recurring", "Recurring bills"], ["ai", "AI & receipts"], ["email", "Email"],
 ];
 let tab = "import";
 
@@ -305,7 +306,7 @@ async function aiTab(el) {
   };
 }
 
-const RENDER = { import: importTab, categories: categoriesTab, rules: rulesTab, cardmap: cardmapTab, recurring: recurringTab, ai: aiTab };
+const RENDER = { import: importTab, categories: categoriesTab, rules: rulesTab, cardmap: cardmapTab, recurring: recurringTab, ai: aiTab, email: emailTab };
 
 export default {
   monthless: true,

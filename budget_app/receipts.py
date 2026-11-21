@@ -28,7 +28,10 @@ def get(db, rid):
     if r["transaction_id"]:
         t = db.execute("SELECT * FROM transactions WHERE id = ?", (r["transaction_id"],)).fetchone()
         r["transaction"] = dict(t) if t else None
-    r.pop("raw_json", None)
+    raw = json.loads(r.pop("raw_json", None) or "{}")
+    r["email"] = raw.get("email")
+    if r["source"] == "email":
+        r["source_text"] = raw.get("text")
     return r
 
 
@@ -46,19 +49,37 @@ def save_items(db, rid, items):
         )
 
 
-def run_parse(db, rid, data=None, media_type=None, text=None):
-    """Call Claude on a stored receipt and save the result."""
-    try:
-        res = ai.parse_receipt(db, data=data, media_type=media_type, text=text)
-    except ai.AIError as e:
-        db.execute("UPDATE receipts SET status = 'error', error = ? WHERE id = ?", (str(e), rid))
-        return False
+def source_of(db, rid):
+    """The text/email details a receipt was read from (kept so it can be re-read)."""
+    r = db.execute("SELECT raw_json FROM receipts WHERE id = ?", (rid,)).fetchone()
+    raw = json.loads(r["raw_json"] or "{}") if r else {}
+    return {"text": raw.get("text"), "email": raw.get("email")}
+
+
+def save_parsed(db, rid, res, text=None, email=None):
+    """Store a parsed receipt. The original text/email details are kept alongside the result."""
+    raw = dict(res)
+    if text:
+        raw["text"] = text
+    if email:
+        raw["email"] = email
+    purchase_date = res.get("purchase_date") or ((email or {}).get("date") or "")[:10] or None
     db.execute(
         """UPDATE receipts SET merchant = ?, purchase_date = ?, subtotal = ?, tax = ?, total = ?,
                status = 'parsed', error = NULL, raw_json = ? WHERE id = ?""",
-        (res["merchant"], res["purchase_date"] or None, res["subtotal"], res["tax"], res["total"], json.dumps(res), rid),
+        (res["merchant"], purchase_date, res["subtotal"], res["tax"], res["total"], json.dumps(raw), rid),
     )
     save_items(db, rid, res["items"])
+
+
+def run_parse(db, rid, data=None, media_type=None, text=None, email=None):
+    """Read a stored receipt with AI and save the result."""
+    try:
+        res = ai.parse_receipt(db, data=data, media_type=media_type, text=text, email=email)
+    except ai.AIError as e:
+        db.execute("UPDATE receipts SET status = 'error', error = ? WHERE id = ?", (str(e), rid))
+        return False
+    save_parsed(db, rid, res, text=text, email=email)
     return True
 
 

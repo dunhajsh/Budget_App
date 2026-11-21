@@ -224,6 +224,85 @@ class AmazonTests(unittest.TestCase):
         self.assertEqual(again["already_imported"], 2)
 
 
+class LocalModelTests(unittest.TestCase):
+    """The Ollama path, with the HTTP call replaced by a fake."""
+
+    def setUp(self):
+        from budget_app import ai
+        from budget_app.db import set_setting
+        self.ai = ai
+        self.tmp = tempfile.mkdtemp()
+        self.db = make_db(self.tmp)
+        self.db.execute("INSERT INTO categories(id, name) VALUES (1, 'Groceries'), (2, 'Toiletries')")
+        set_setting(self.db, "ai_provider", "ollama")
+        set_setting(self.db, "ollama_model", "test-vision")
+        self.calls = []
+        self.replies = []
+        self._orig = ai._ollama_request
+
+        def fake(db, path, body=None, timeout=0):
+            self.calls.append(body)
+            return {"message": {"content": json.dumps(self.replies.pop(0))}, "done_reason": "stop"}
+        ai._ollama_request = fake
+
+    def tearDown(self):
+        self.ai._ollama_request = self._orig
+        self.db.close()
+        shutil.rmtree(self.tmp)
+
+    def receipt(self, items, subtotal):
+        return {"merchant": "Store", "purchase_date": "2026-11-14T10:00:00", "subtotal": subtotal, "tax": 0.5,
+                "total": subtotal + 0.5, "card_last4": "", "items": [
+                    {"name": n, "quantity": 1, "amount": a, "taxable": True, "category_id": 1} for n, a in items]}
+
+    def image(self):
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (40, 80), "white").save(buf, "PNG")
+        return buf.getvalue()
+
+    def test_enabled_and_request_shape(self):
+        self.assertTrue(self.ai.enabled(self.db))
+        self.replies = [self.receipt([("Milk", 3.0), ("Soap", 2.0)], 5.0)]
+        res = self.ai.parse_receipt(self.db, data=self.image(), media_type="image/png")
+        self.assertEqual(res["purchase_date"], "2026-11-14")  # time stripped
+        self.assertEqual(len(self.calls), 1)  # added up, so no careful re-read
+        body = self.calls[0]
+        self.assertEqual(body["model"], "test-vision")
+        self.assertFalse(body["think"])
+        self.assertEqual(len(body["messages"][1]["images"]), 1)
+        self.assertIn("1: Groceries", body["messages"][1]["content"])
+        self.assertEqual(body["format"], self.ai.RECEIPT_SCHEMA)
+
+    def test_rereads_carefully_when_items_dont_add_up(self):
+        self.replies = [self.receipt([("Milk", 3.0)], 5.0), self.receipt([("Milk", 3.0), ("Soap", 2.0)], 5.0)]
+        res = self.ai.parse_receipt(self.db, text="MILK 3.00\nSOAP 2.00\nSUBTOTAL 5.00")
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(self.calls[1]["think"])
+        self.assertEqual(len(res["items"]), 2)
+
+    def test_text_pdf_is_sent_as_text(self):
+        from pypdf import PdfWriter
+        from pypdf.generic import NameObject
+        # Minimal one-page PDF with a text layer.
+        w = PdfWriter()
+        page = w.add_blank_page(300, 300)
+        from pypdf.generic import DecodedStreamObject, DictionaryObject
+        stream = DecodedStreamObject()
+        stream.set_data(b"BT /F1 12 Tf 20 200 Td (MEIJER  MILK 3.00  SOAP 2.00  SUBTOTAL 5.00) Tj ET")
+        font = DictionaryObject({NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"),
+                                 NameObject("/BaseFont"): NameObject("/Helvetica")})
+        page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})})
+        page[NameObject("/Contents")] = w._add_object(stream)
+        buf = io.BytesIO()
+        w.write(buf)
+        self.replies = [self.receipt([("Milk", 3.0), ("Soap", 2.0)], 5.0)]
+        self.ai.parse_receipt(self.db, data=buf.getvalue(), media_type="application/pdf")
+        msg = self.calls[0]["messages"][1]
+        self.assertNotIn("images", msg)
+        self.assertIn("SUBTOTAL 5.00", msg["content"])
+
+
 class ApiSmokeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

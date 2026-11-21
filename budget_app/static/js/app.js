@@ -127,7 +127,7 @@ export async function loadCategories() {
 export async function refreshStatus() {
   state.status = await api("/status");
   document.getElementById("ai-status").innerHTML = state.status.ai_enabled
-    ? `<span class="badge good">AI receipt reading on</span>`
+    ? `<span class="badge good" title="Receipts are read by ${esc(state.status.ai_label || "")}">AI: ${esc(state.status.ai_label || "on")}</span>`
     : `<a href="#/settings">Turn on AI receipt reading →</a>`;
   try {
     const s = await api(`/summary?month=${state.month}`);

@@ -69,7 +69,7 @@ export async function openReceipt(id) {
         </div>
       </div></div>`,
     foot: `<button class="danger" data-delete>Delete</button>
-      ${r.stored_path || r.source === "text" ? `<button data-reparse ${state.status.ai_enabled ? "" : "disabled title='Add an API key in Settings'"}>✨ Re-read</button>` : ""}
+      ${r.stored_path || r.source === "text" ? `<button data-reparse ${state.status.ai_enabled ? "" : "disabled title='Turn on AI in Settings'"}>✨ Re-read</button>` : ""}
       <span class="spacer"></span>
       <button data-cash>Record as cash/debit</button>
       <button data-save>Save</button>
@@ -238,7 +238,7 @@ export default {
     const open = list.filter((r) => r.status !== "applied");
     const done = list.filter((r) => r.status === "applied");
     el.innerHTML = `<div class="stack">
-      ${state.status.ai_enabled ? "" : `<div class="alert info"><span class="ico">✨</span><span>Add an Anthropic API key in <a href="#/settings">Settings</a>
+      ${state.status.ai_enabled ? "" : `<div class="alert info"><span class="ico">✨</span><span>Turn on AI in <a href="#/settings">Settings</a> (a free local model, or Claude)
         and receipts will be read automatically - every line item extracted, categorized, and matched to the right card charge.
         Without it you can still type items in by hand.</span></div>`}
       <div class="grid grid-3">
@@ -261,7 +261,7 @@ export default {
     const input = dz.querySelector("input");
     const upload = async (files) => {
       if (!files.length) return;
-      dz.innerHTML = `<span class="spinner"></span> ${state.status.ai_enabled ? `Reading ${files.length} receipt(s) - about 10–30 seconds each…` : "Uploading…"}`;
+      dz.innerHTML = `<span class="spinner"></span> ${state.status.ai_enabled ? `Reading ${files.length} receipt(s) - about ${state.status.ai_local ? "20 seconds to 2 minutes" : "10–30 seconds"} each…` : "Uploading…"}`;
       const fd = new FormData();
       for (const f of files) fd.append("files", f);
       try {
@@ -279,7 +279,7 @@ export default {
     dz.ondrop = (e) => { e.preventDefault(); dz.classList.remove("drag"); upload([...e.dataTransfer.files]); };
     el.querySelector("[data-amazon]").onclick = amazonDialog;
     el.querySelector("[data-text]").onclick = () => {
-      if (!state.status.ai_enabled) return toast("Reading pasted text needs an API key (Settings).", { error: true });
+      if (!state.status.ai_enabled) return toast("Reading pasted text needs AI turned on (Settings).", { error: true });
       textDialog();
     };
     el.querySelectorAll("[data-open]").forEach((c) => (c.onclick = () => openReceipt(+c.dataset.open)));

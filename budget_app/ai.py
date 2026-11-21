@@ -1,12 +1,19 @@
-"""Claude-powered helpers: read receipts, and suggest categories.
+"""AI helpers: read receipts, and suggest categories.
 
-Everything here is optional. Without an API key the app still works; you just
-enter receipt line items and categories yourself.
+Two providers are supported:
+- "anthropic": Claude via the Anthropic API (most accurate; needs an API key).
+- "ollama": a vision model running locally through Ollama (free; nothing leaves the computer).
+
+Everything here is optional. Without AI the app still works; you just enter
+receipt line items and categories yourself.
 """
 import base64
 import io
 import json
 import os
+import re
+import urllib.error
+import urllib.request
 
 from .db import get_setting
 
@@ -19,12 +26,36 @@ class AIError(Exception):
     pass
 
 
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+
+
 def api_key(db):
     return get_setting(db, "anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
 
 
+def provider(db):
+    return get_setting(db, "ai_provider") or "anthropic"
+
+
+def ollama_url(db):
+    return (get_setting(db, "ollama_url") or DEFAULT_OLLAMA_URL).rstrip("/")
+
+
+def ollama_model(db):
+    return get_setting(db, "ollama_model") or ""
+
+
 def enabled(db):
+    if provider(db) == "ollama":
+        return bool(ollama_model(db))
     return bool(api_key(db))
+
+
+def describe(db):
+    """Short label for the UI, e.g. 'Claude' or 'qwen3.5:4b (local)'."""
+    if not enabled(db):
+        return None
+    return f"{ollama_model(db)} (local)" if provider(db) == "ollama" else "Claude"
 
 
 def _client(db):
@@ -66,7 +97,13 @@ def _guidance(db):
     return "\n\n".join(parts)
 
 
-def _call(db, content, schema, system, effort="medium", max_tokens=16000):
+def _call(db, content, schema, system, effort="medium", max_tokens=16000, think=False):
+    if provider(db) == "ollama":
+        return _call_ollama(db, content, schema, system, think=think)
+    return _call_anthropic(db, content, schema, system, effort, max_tokens)
+
+
+def _call_anthropic(db, content, schema, system, effort, max_tokens):
     import anthropic
 
     client = _client(db)
@@ -104,6 +141,105 @@ def _call(db, content, schema, system, effort="medium", max_tokens=16000):
         return json.loads(text)
     except json.JSONDecodeError as e:
         raise AIError("The model returned malformed JSON.") from e
+
+
+# ---------------------------------------------------------------- ollama (local)
+
+def _ollama_request(db, path, body=None, timeout=900):
+    url = ollama_url(db) + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read()).get("error", "")
+        except Exception:
+            pass
+        if e.code == 404 and "not found" in detail:
+            raise AIError(f"Ollama doesn't have the model '{ollama_model(db)}'. Pick another under Settings, "
+                          f"or run: ollama pull {ollama_model(db)}") from e
+        raise AIError(f"Ollama error ({e.code}): {detail or e.reason}") from e
+    except TimeoutError as e:
+        raise AIError("The local model took too long. Try a smaller photo or a smaller model.") from e
+    except (urllib.error.URLError, ConnectionError) as e:
+        raise AIError(f"Couldn't reach Ollama at {ollama_url(db)} - is it running?") from e
+
+
+def ollama_models(db):
+    """Installed models, with whether each can read images."""
+    tags = _ollama_request(db, "/api/tags", timeout=10).get("models", [])
+    out = []
+    for m in tags:
+        caps = []
+        try:
+            caps = _ollama_request(db, "/api/show", {"model": m["name"]}, timeout=10).get("capabilities", [])
+        except AIError:
+            pass
+        out.append({"name": m["name"], "size": m.get("size"), "vision": "vision" in caps})
+    return out
+
+
+def _call_ollama(db, content, schema, system, think=False):
+    model = ollama_model(db)
+    if not model:
+        raise AIError("No local model selected. Pick one under Settings.")
+    texts, images = [], []
+    for b in content:
+        if b["type"] == "text":
+            texts.append(b["text"])
+        elif b["type"] == "image":
+            images.append(b["source"]["data"])
+        else:  # PDFs are converted to text/images before they get here
+            raise AIError("The local model can't read this file type.")
+    msg = {"role": "user", "content": "\n\n".join(texts)}
+    if images:
+        msg["images"] = images
+    body = {
+        "model": model,
+        "stream": False,
+        "format": schema,
+        "think": bool(think),
+        "options": {"temperature": 0, "num_ctx": 16384},
+        "messages": [{"role": "system", "content": system}, msg],
+    }
+    try:
+        res = _ollama_request(db, "/api/chat", body)
+    except AIError as e:
+        if think and "think" in str(e).lower():  # model has no thinking mode
+            body["think"] = False
+            res = _ollama_request(db, "/api/chat", body)
+        else:
+            raise
+    if res.get("done_reason") == "length":
+        raise AIError("The local model's answer was cut off. Try splitting the receipt into two photos.")
+    text = (res.get("message") or {}).get("content", "")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise AIError("The local model returned malformed JSON. Try Re-read.") from e
+
+
+def _pdf_for_local(data):
+    """Ollama can't read PDFs: use the PDF's text if it has some (emailed receipts),
+    otherwise the scanned page images inside it."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as e:  # pragma: no cover
+        raise AIError("Reading PDFs with a local model needs pypdf. Run: pip install -r requirements.txt") from e
+    reader = PdfReader(io.BytesIO(data))
+    text = "\n".join((p.extract_text() or "") for p in reader.pages[:10]).strip()
+    if len(text) >= 40:
+        return [{"type": "text", "text": "Receipt text:\n\n" + text}]
+    blocks = []
+    for page in reader.pages[:4]:
+        for im in page.images[:2]:
+            blocks.append(_image_block(im.data, None, max_side=2048))
+    if not blocks:
+        raise AIError("Couldn't find text or images in this PDF. Try a screenshot instead.")
+    return blocks
 
 
 # ---------------------------------------------------------------- receipts
@@ -151,13 +287,12 @@ Rules:
 - If something is unreadable, give your best reading rather than skipping it, so the items still add up to the subtotal."""
 
 
-def _image_block(data, media_type):
+def _image_block(data, media_type, max_side=3000):
     from PIL import Image, ImageOps
 
     img = Image.open(io.BytesIO(data))
     img = ImageOps.exif_transpose(img).convert("RGB")
     # Keep plenty of resolution for small receipt text, but stay under the API size cap.
-    max_side = 3000
     if max(img.size) > max_side:
         img.thumbnail((max_side, max_side))
     for quality in (88, 80, 70, 60):
@@ -172,24 +307,61 @@ def _image_block(data, media_type):
     }
 
 
+def _looks_right(res):
+    """Sanity checks for a quick local read: do the line items add up to the subtotal,
+    and is the tax plausible for the items marked taxable (US rates are under ~11%)?"""
+    items = res.get("items", [])
+    total = round(sum(float(i.get("amount") or 0) for i in items), 2)
+    targets = [res.get("subtotal") or 0, (res.get("total") or 0) - (res.get("tax") or 0)]
+    if not any(t and abs(total - t) <= 0.05 for t in targets):
+        return False
+    tax = float(res.get("tax") or 0)
+    if tax > 0.05:
+        taxable = sum(float(i.get("amount") or 0) for i in items if i.get("taxable"))
+        if taxable <= 0 or tax / taxable > 0.11:
+            return False
+    return True
+
+
+def _clean_receipt(res):
+    m = re.search(r"\d{4}-\d{2}-\d{2}", res.get("purchase_date") or "")
+    res["purchase_date"] = m.group(0) if m else ""
+    return res
+
+
 def parse_receipt(db, data=None, media_type=None, text=None):
+    local = provider(db) == "ollama"
     content = []
     if text:
         content.append({"type": "text", "text": "Receipt text:\n\n" + text})
     elif media_type == "application/pdf":
-        content.append(
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                             "data": base64.standard_b64encode(data).decode()}}
-        )
+        if local:
+            content.extend(_pdf_for_local(data))
+        else:
+            content.append(
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                 "data": base64.standard_b64encode(data).decode()}}
+            )
     else:
-        content.append(_image_block(data, media_type))
+        # Local vision models get a smaller image: faster, and it fits in a laptop GPU.
+        content.append(_image_block(data, media_type, max_side=2048 if local else 3000))
     prompt = "Categories (id: name):\n" + category_lines(db)
     g = _guidance(db)
     if g:
         prompt += "\n\n" + g
     prompt += "\n\nExtract this receipt."
     content.append({"type": "text", "text": prompt})
-    return _call(db, content, RECEIPT_SCHEMA, RECEIPT_SYSTEM, effort="medium")
+
+    if not local:
+        return _clean_receipt(_call(db, content, RECEIPT_SCHEMA, RECEIPT_SYSTEM, effort="medium"))
+
+    # Small local models: a quick pass first; if the items or tax don't add up, read it again
+    # carefully with thinking on (slower, but catches missed lines like coupons).
+    mode = get_setting(db, "ollama_think") or "auto"
+    res = _call(db, content, RECEIPT_SCHEMA, RECEIPT_SYSTEM, think=(mode == "always"))
+    if mode == "auto" and not _looks_right(res):
+        res = _call(db, content, RECEIPT_SCHEMA, RECEIPT_SYSTEM, think=True)
+    return _clean_receipt(res)
 
 
 # ---------------------------------------------------------------- categorization
@@ -222,7 +394,7 @@ def categorize(db, entries, kind="card transactions"):
         return {}
     valid = {r["id"] for r in db.execute("SELECT id FROM categories WHERE archived = 0")}
     out = {}
-    chunk = 150
+    chunk = 40 if provider(db) == "ollama" else 150  # small local models do better with short lists
     for start in range(0, len(entries), chunk):
         part = entries[start:start + chunk]
         listing = "\n".join(f"{start + i}. {e}" for i, e in enumerate(part))

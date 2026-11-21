@@ -1,4 +1,4 @@
-import { api, catOptions, esc, fail, hashParams, loadCategories, money, render, state, toast } from "../app.js";
+import { api, catOptions, esc, fail, hashParams, loadCategories, money, refreshStatus, render, state, toast } from "../app.js";
 import { importDialog } from "./transactions.js";
 
 const TABS = [
@@ -204,31 +204,103 @@ async function recurringTab(el) {
 
 async function aiTab(el) {
   const s = await api("/settings");
+  const local = s.ai_provider === "ollama";
   el.innerHTML = `<div class="stack"><div class="panel">
     <h2>Automatic receipt reading</h2>
-    <p class="small muted">Receipts, pasted receipt text, Amazon items and leftover card transactions are read and categorized by Claude
-      (Anthropic's AI). You need an API key from <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a> → API Keys.
-      A typical receipt costs a few cents to read. Images are sent to Anthropic for processing only when you upload them.</p>
-    <div class="row"><input id="key" type="password" placeholder="${s.api_key_set ? "Key saved " + esc(s.api_key_hint || "(from environment)") : "sk-ant-…"}" style="flex:1;max-width:420px">
-      <button class="primary" data-savekey>Save key</button>${s.api_key_source === "settings" ? `<button data-clearkey>Remove</button>` : ""}</div>
-    <div class="small" style="margin-top:6px">${s.api_key_set ? `<span class="good">● Connected</span>${s.api_key_source === "environment" ? " (ANTHROPIC_API_KEY environment variable)" : ""}` : `<span class="muted">● Not set</span>`}</div>
+    <p class="small muted" style="margin-top:0">Receipts, pasted receipt text, Amazon items and leftover card transactions can be read and categorized by AI.
+      Pick where that AI runs.</p>
+    <div class="stack" style="gap:6px;margin-bottom:14px">
+      <label><input type="radio" name="prov" value="ollama" ${local ? "checked" : ""}> <b>On this computer (Ollama)</b>
+        <span class="small muted">: free and private, slower, less accurate on messy photos</span></label>
+      <label><input type="radio" name="prov" value="anthropic" ${local ? "" : "checked"}> <b>Claude (Anthropic API)</b>
+        <span class="small muted">: most accurate, a few cents per receipt</span></label>
+    </div>
+
+    <div id="p-ollama" ${local ? "" : "hidden"}>
+      <div class="row"><label class="small muted" style="width:100px">Ollama URL</label>
+        <input id="o-url" value="${esc(s.ollama_url)}" style="flex:1;max-width:460px"><button data-otest>Check</button></div>
+      <div class="row" style="margin-top:8px"><label class="small muted" style="width:100px">Model</label>
+        <select id="o-model" style="flex:1;max-width:460px"><option value="">Checking Ollama…</option></select></div>
+      <div class="row" style="margin-top:8px"><label class="small muted" style="width:100px">Careful mode</label>
+        <select id="o-think" style="flex:1;max-width:460px">
+          <option value="auto" ${s.ollama_think === "auto" ? "selected" : ""}>Auto: quick read, re-read carefully if totals don't add up</option>
+          <option value="always" ${s.ollama_think === "always" ? "selected" : ""}>Always careful (most accurate, 1–2 min per receipt)</option>
+          <option value="never" ${s.ollama_think === "never" ? "selected" : ""}>Never (fastest)</option>
+        </select></div>
+      <div class="small" id="o-status" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:10px"><span class="spacer"></span><button class="primary" data-osave>Use local model</button></div>
+    </div>
+
+    <div id="p-anthropic" ${local ? "hidden" : ""}>
+      <p class="small muted">You need an API key from <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a> → API Keys.
+        Images are sent to Anthropic for processing only when you upload them.</p>
+      <div class="row"><input id="key" type="password" placeholder="${s.api_key_set ? "Key saved " + esc(s.api_key_hint || "(from environment)") : "sk-ant-…"}" style="flex:1;max-width:420px">
+        <button class="primary" data-savekey>${local ? "Use Claude" : "Save key"}</button>${s.api_key_source === "settings" ? `<button data-clearkey>Remove key</button>` : ""}</div>
+      <div class="small" style="margin-top:6px">${s.api_key_set ? `<span class="good">● Key saved</span>${s.api_key_source === "environment" ? " (ANTHROPIC_API_KEY environment variable)" : ""}` : `<span class="muted">● Not set</span>`}</div>
+    </div>
   </div>
   <div class="panel"><h2>Household notes for categorizing</h2>
     <p class="small muted">Plain-English hints the AI follows when sorting purchases. Be specific about who/what each envelope is for.</p>
     <textarea id="notes" placeholder="e.g.\nUlta purchases go to Beauty.\nDepop and T.J. Maxx are usually Clothes.\nMeijer Express is gas for the car.\nAnything for the dog goes to Miscellaneous › Pets.">${esc(s.categorization_notes)}</textarea>
     <div class="row" style="margin-top:8px"><span class="spacer"></span><button class="primary" data-savenotes>Save notes</button></div>
   </div></div>`;
-  el.querySelector("[data-savekey]").onclick = async () => {
-    const k = el.querySelector("#key").value.trim();
-    if (!k) return;
-    await api("/settings", { method: "PUT", body: { anthropic_api_key: k } });
-    toast("API key saved");
-    render();
+
+  const $ = (q) => el.querySelector(q);
+  let checked = false;
+  el.querySelectorAll("input[name=prov]").forEach((r) => (r.onchange = () => {
+    const v = el.querySelector("input[name=prov]:checked").value;
+    $("#p-ollama").hidden = v !== "ollama";
+    $("#p-anthropic").hidden = v !== "anthropic";
+    if (v === "ollama" && !checked) checkOllama();
+  }));
+
+  async function checkOllama() {
+    checked = true;
+    const st = $("#o-status"), sel = $("#o-model");
+    st.innerHTML = `<span class="spinner"></span> Checking Ollama…`;
+    let r;
+    try { r = await api(`/ai/ollama-models?url=${encodeURIComponent($("#o-url").value.trim())}`); }
+    catch (e) { st.innerHTML = `<span class="bad">● ${esc(e.message)}</span>`; return; }
+    if (!r.ok) {
+      sel.innerHTML = `<option value="">-</option>`;
+      st.innerHTML = `<span class="bad">● ${esc(r.error)}</span> Start Ollama (it runs in the system tray), then click Check.`;
+      return;
+    }
+    const vision = r.models.filter((m) => m.vision);
+    const pick = s.ollama_model || (vision[0] || {}).name || "";
+    sel.innerHTML = r.models.map((m) => `<option value="${esc(m.name)}" ${m.name === pick ? "selected" : ""}>${esc(m.name)}${m.vision ? " · reads images" : " · text only"}${m.size ? ` · ${(m.size / 1e9).toFixed(1)} GB` : ""}</option>`).join("")
+      || `<option value="">No models installed</option>`;
+    st.innerHTML = vision.length
+      ? `<span class="good">● Ollama is running</span> · ${r.models.length} model(s) installed${local && s.ollama_model ? ` · in use: <b>${esc(s.ollama_model)}</b>` : ""}`
+      : `<span class="bad">● No vision model installed.</span> Receipts need one that reads images. In a terminal: <code>ollama pull qwen3.5:4b</code>`;
+  }
+  if (local) checkOllama();
+  $("[data-otest]").onclick = checkOllama;
+  $("[data-osave]").onclick = async () => {
+    const model = $("#o-model").value;
+    if (!model) return toast("Pick a model first", { error: true });
+    try {
+      await api("/settings", { method: "PUT", body: { ai_provider: "ollama", ollama_url: $("#o-url").value.trim(), ollama_model: model, ollama_think: $("#o-think").value } });
+      toast(`Using ${model} on this computer`);
+      await refreshStatus();
+      render();
+    } catch (e) { fail(e); }
   };
-  const ck = el.querySelector("[data-clearkey]");
-  if (ck) ck.onclick = async () => { await api("/settings", { method: "PUT", body: { anthropic_api_key: "" } }); render(); };
-  el.querySelector("[data-savenotes]").onclick = async () => {
-    await api("/settings", { method: "PUT", body: { categorization_notes: el.querySelector("#notes").value } });
+
+  $("[data-savekey]").onclick = async () => {
+    const k = $("#key").value.trim();
+    if (!k && !s.api_key_set) return toast("Paste an API key first", { error: true });
+    try {
+      await api("/settings", { method: "PUT", body: { ...(k ? { anthropic_api_key: k } : {}), ai_provider: "anthropic" } });
+      toast("Using Claude");
+      await refreshStatus();
+      render();
+    } catch (e) { fail(e); }
+  };
+  const ck = $("[data-clearkey]");
+  if (ck) ck.onclick = async () => { await api("/settings", { method: "PUT", body: { anthropic_api_key: "" } }); await refreshStatus(); render(); };
+  $("[data-savenotes]").onclick = async () => {
+    await api("/settings", { method: "PUT", body: { categorization_notes: $("#notes").value } });
     toast("Notes saved");
   };
 }

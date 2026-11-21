@@ -4,7 +4,7 @@ A local envelope-budgeting app that replaces a yearly Excel budget. It runs on y
 
 - **Imports your old spreadsheet**: every year, every envelope, every amount inside the `=12.34+56.78` formulas. Carried-over balances are reconciled so they match the spreadsheet to the cent.
 - **Imports card statements (CSV)**: purchases are sorted automatically by merchant rules that learn as you categorize ("Always put *Ulta* in *Beauty*?"). Card payments are recognized and left out of the budget.
-- **Receipts**: drop in photos, PDFs or pasted email receipts. Claude reads every line item, sorts each into an envelope/subcategory, finds the matching card charge, and splits that charge (tax spread proportionally). One $180 Meijer charge becomes Groceries › Produce, Toiletries, House › Household Supplies, …
+- **Receipts**: drop in photos, PDFs or pasted email receipts. AI (a free local model through Ollama, or Claude) reads every line item, sorts each into an envelope/subcategory, finds the matching card charge, and splits that charge (tax spread proportionally). One $180 Meijer charge becomes Groceries › Produce, Toiletries, House › Household Supplies, …
 - **Amazon**: import your Amazon order history. Each shipment is matched to its card charge and split by item.
 - **Envelope budgeting**: income, monthly amounts per envelope ("Fill with usual amounts" / "Copy last month"), carry-over, overspending alerts.
 - **Recurring bills**: mortgage, car payment, giving, loans. Add them to a month with one click (suggestions come from your history).
@@ -26,7 +26,9 @@ On Windows you can double-click **Start Budget.bat**.
 ### First-time setup
 1. **Settings → Import & data**: drop in your budget `.xlsx`.
 2. **Transactions → Import statement**: drop in your card's CSV export.
-3. **Settings → AI & receipts** (optional): paste an Anthropic API key from <https://console.anthropic.com/> to turn on automatic receipt reading and category suggestions. Everything else works without it.
+3. **Settings → AI & receipts** (optional): turn on automatic receipt reading and category suggestions. Everything else works without it. Pick one:
+   - **Local (Ollama)**: free, and nothing leaves your computer. Install [Ollama](https://ollama.com), run `ollama pull qwen3.5:4b` (or any model that reads images), then choose it in Settings. A receipt takes about 15 seconds; if the items or tax don't add up, it's re-read carefully (about 1 minute).
+   - **Claude**: most accurate on crumpled or long receipts. Paste an Anthropic API key from <https://console.anthropic.com/>. A few cents per receipt.
 
 ## Monthly routine (about 10 minutes)
 1. **Budget**: add paychecks, click *Fill with usual amounts*, adjust, and aim for **$0 left to budget**. Click *Add bills* for recurring bills.
@@ -47,7 +49,7 @@ Neither Meijer nor Amazon offers a public API for personal purchase history, and
 
 ## Data & privacy
 - Everything is stored in `data/budget.db` (plus receipt images in `data/receipts/`). `data/` is git-ignored, so no financial data ever goes into the repository. Back it up from **Settings → Import & data → Download backup**.
-- Images and text are only sent to Anthropic when you upload a receipt or click *Suggest categories* (with an API key set). The API key is stored in the local database.
+- With the local (Ollama) option, receipts never leave your computer. With Claude, images and text are sent to Anthropic only when you upload a receipt or click *Suggest categories*. The API key is stored in the local database.
 
 ## Development
 
@@ -63,7 +65,7 @@ budget_app/
   budget.py           envelope math: carry-over, available, history
   categorize.py       merchant normalization + rules
   receipts.py         receipt matching and tax-aware splitting
-  ai.py               Claude calls (receipt reading, categorization)
+  ai.py               AI calls via Claude or local Ollama (receipt reading, categorization)
   importers/          excel.py · statement.py · amazon.py
   static/, templates/ single-page front end (vanilla JS + Chart.js)
 ```

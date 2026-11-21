@@ -242,7 +242,7 @@ export default {
         <input id="search" placeholder="Search…" value="${esc(search)}" style="width:180px">
         <span class="spacer"></span>
         <button data-rules title="Re-run your merchant rules on uncategorized transactions">⚡ Run rules</button>
-        ${state.status.ai_enabled ? `<button data-ai title="Ask Claude to suggest categories for the rest">✨ Suggest categories</button>` : ""}
+        ${state.status.ai_enabled ? `<button data-ai title="Ask the AI to suggest categories for the rest">✨ Suggest categories</button>` : ""}
         <button data-reviewall>✓ Mark all reviewed</button>
         <button class="primary" data-import>⬆ Import statement</button>
       </div>

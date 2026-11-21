@@ -59,6 +59,8 @@ def status():
     )]
     return jsonify(
         ai_enabled=ai.enabled(db),
+        ai_label=ai.describe(db),
+        ai_local=ai.provider(db) == "ollama",
         has_categories=bool(db.execute("SELECT 1 FROM categories LIMIT 1").fetchone()),
         latest_month=max(filter(None, [latest, latest_alloc]), default=date.today().strftime("%Y-%m")),
         months=months,
@@ -77,6 +79,10 @@ def get_settings():
         api_key_hint=("…" + key[-4:]) if key else "",
         categorization_notes=get_setting(db, "categorization_notes") or "",
         default_account=get_setting(db, "default_account") or "SoFi Credit Card",
+        ai_provider=ai.provider(db),
+        ollama_url=ai.ollama_url(db),
+        ollama_model=ai.ollama_model(db),
+        ollama_think=get_setting(db, "ollama_think") or "auto",
     )
 
 
@@ -86,11 +92,30 @@ def put_settings():
     b = _body()
     if "anthropic_api_key" in b:
         set_setting(db, "anthropic_api_key", (b["anthropic_api_key"] or "").strip())
-    for k in ("categorization_notes", "default_account"):
+    if b.get("ai_provider") not in (None, "anthropic", "ollama"):
+        abort(400, "ai_provider must be anthropic or ollama")
+    if b.get("ollama_think") not in (None, "auto", "always", "never"):
+        abort(400, "ollama_think must be auto, always or never")
+    for k in ("categorization_notes", "default_account", "ai_provider", "ollama_url", "ollama_model", "ollama_think"):
         if k in b:
-            set_setting(db, k, b[k])
+            set_setting(db, k, (b[k] or "").strip() if k.startswith("ollama") else b[k])
     db.commit()
     return get_settings()
+
+
+@bp.get("/ai/ollama-models")
+def ollama_models():
+    db = get_db()
+    url = request.args.get("url")
+    if url:  # test a URL before saving it
+        set_setting(db, "ollama_url", url.strip())
+    try:
+        return jsonify(ok=True, url=ai.ollama_url(db), models=ai.ollama_models(db))
+    except ai.AIError as e:
+        return jsonify(ok=False, url=ai.ollama_url(db), error=str(e), models=[])
+    finally:
+        if url:
+            db.rollback()
 
 
 # ------------------------------------------------------------------ categories

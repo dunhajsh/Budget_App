@@ -78,7 +78,7 @@ def get_settings():
         api_key_source="settings" if key else ("environment" if os.environ.get("ANTHROPIC_API_KEY") else None),
         api_key_hint=("…" + key[-4:]) if key else "",
         categorization_notes=get_setting(db, "categorization_notes") or "",
-        default_account=get_setting(db, "default_account") or "SoFi Credit Card",
+        default_account=get_setting(db, "default_account") or "Credit Card",
         ai_provider=ai.provider(db),
         ollama_url=ai.ollama_url(db),
         ollama_model=ai.ollama_model(db),

@@ -178,7 +178,7 @@ export function importDialog() {
         <input type="file" accept=".csv,text/csv" hidden></div>
       <div id="preview" class="muted small"></div>
       <div class="grid grid-2">
-        <label class="field">Account name<input name="account" list="acct" value="${esc(accounts[0] || "SoFi Credit Card")}">
+        <label class="field">Account name<input name="account" list="acct" value="${esc(accounts[0] || "Credit Card")}">
           <datalist id="acct">${accounts.map((a) => `<option value="${esc(a)}">`).join("")}</datalist></label>
         <label class="field">Counts toward budget month<input type="month" name="budget_month" value="${state.month}"></label>
       </div>

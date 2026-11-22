@@ -216,6 +216,8 @@ export function setMonth(m) {
 
 async function boot() {
   state.status = await api("/status");
+  const linked = hashParams().get("month");   // links like #/transactions?month=2026-09
+  if (linked && /^\d{4}-\d{2}$/.test(linked)) { state.month = linked; localStorage.setItem("month", linked); }
   if (!state.month) state.month = state.status.latest_month;
   await loadCategories();
   document.getElementById("month-switch").addEventListener("click", (e) => {

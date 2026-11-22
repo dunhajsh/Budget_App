@@ -297,6 +297,7 @@ class BankAccountTests(unittest.TestCase):
         # Re-import: nothing new.
         again = statement.import_statement(self.db, BANK_CSV, "Joint-Savings.csv")
         self.assertEqual((again["imported"], len(again["income_added"])), (0, 0))
+        self.assertEqual(again["history_skipped"], res["history_skipped"])   # earlier matches count as duplicates
 
     def test_same_amount_in_two_envelopes_is_not_guessed(self):
         db = self.db

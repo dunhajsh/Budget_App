@@ -247,7 +247,7 @@ def list_transactions():
     if month:
         where.append("t.budget_month = ?")
         args.append(_month(month))
-    if request.args.get("include_excel") != "1":
+    if request.args.get("include_excel") == "0":
         where.append("t.source != 'excel'")
     f = request.args.get("filter")
     if f == "uncategorized":

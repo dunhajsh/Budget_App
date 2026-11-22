@@ -5,6 +5,8 @@ let search = "";
 let selected = new Set();
 let txns = [];
 
+// A spreadsheet entry that no statement line has been matched to yet (no real merchant name).
+const unnamed = (t) => t.source === "excel" && / \(spreadsheet\)$/.test(t.description || "");
 const titleCase = (s) => (s || "").toLowerCase().replace(/\b([a-z])/g, (c) => c.toUpperCase());
 const shortDate = (d) => new Date(d + "T12:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 
@@ -21,12 +23,13 @@ function row(t) {
   const monthTag = t.date.slice(0, 7) !== t.budget_month ? `<span class="badge" title="Counts toward ${monthLabel(t.budget_month)}">→ ${monthLabel(t.budget_month, true)}</span>` : "";
   const auto = !t.reviewed && !t.excluded && t.splits.length ? `<span class="badge accent" title="Auto-categorized - click ✓ to confirm">auto</span>` : "";
   const receipt = t.receipt_id ? `<a class="badge good" href="#/receipts?open=${t.receipt_id}" title="Itemized from a receipt">🧾 receipt</a>` : "";
+  const sheet = t.source === "excel" ? `<span class="badge" title="From your budget spreadsheet${unnamed(t) ? "" : " - merchant name and date from your card/bank statement"}">spreadsheet</span>` : "";
   return `<tr data-id="${t.id}" class="${t.excluded ? "excluded" : ""}">
     <td><input type="checkbox" data-sel="${t.id}" ${selected.has(t.id) ? "checked" : ""}></td>
     <td class="small" style="white-space:nowrap">${shortDate(t.date)}</td>
-    <td><div class="desc-main">${esc(titleCase(t.merchant || t.description))}</div>
-      <div class="desc-raw">${esc(t.description)} ${t.statement_category ? `· ${esc(t.statement_category)}` : ""} · ${esc(t.account || "")}</div>
-      <div class="row" style="gap:4px;margin-top:2px">${auto}${receipt}${monthTag}${t.notes ? `<span class="badge" title="${esc(t.notes)}">note</span>` : ""}</div></td>
+    <td><div class="desc-main">${unnamed(t) ? `<span class="muted">Spreadsheet entry</span>` : esc(titleCase(t.merchant || t.description))}</div>
+      <div class="desc-raw">${unnamed(t) ? "No matching statement line (entered by hand or combined)" : `${esc(t.description)} ${t.statement_category ? `· ${esc(t.statement_category)}` : ""} · ${esc(t.account || "")}`}</div>
+      <div class="row" style="gap:4px;margin-top:2px">${sheet}${auto}${receipt}${monthTag}${t.notes ? `<span class="badge" title="${esc(t.notes)}">note</span>` : ""}</div></td>
     <td style="min-width:200px">${catCell(t)}</td>
     <td class="num ${t.amount < 0 ? "good" : ""}">${money(t.amount)}</td>
     <td style="white-space:nowrap">
@@ -148,7 +151,7 @@ function moreMenu(t) {
       <label class="row"><input type="checkbox" name="excluded" ${t.excluded ? "checked" : ""}> Not part of the budget (card payment, transfer, reimbursed)</label>
       ${t.amount < 0 && t.source === "statement" ? `<div class="small muted">A deposit that's really income (side job, gift)? <button class="small" data-income>Count as income</button></div>` : ""}
     </div>`,
-    foot: `${t.source !== "statement" ? `<button class="danger" data-del>Delete</button>` : ""}<span class="spacer"></span>
+    foot: `${t.source === "manual" || t.source === "recurring" ? `<button class="danger" data-del>Delete</button>` : ""}<span class="spacer"></span>
            <button data-close>Cancel</button><button class="primary" data-save>Save</button>`,
     onMount(root, close) {
       root.querySelector("[data-save]").onclick = async () => {
@@ -283,17 +286,21 @@ function showResults(results) {
       </div>
       ${rules.length ? `<div><b>Learned ${rules.length} merchant rules from your spreadsheet history</b>${sum("recategorized") ? ` (and re-sorted ${sum("recategorized")} unreviewed transactions)` : ""}:
         <div class="small muted" style="margin-top:4px;columns:2">${rules.map((r) => `${esc(r.pattern)} → ${esc(r.category)}`).join("<br>")}</div></div>` : ""}
-      ${sum("duplicates") ? `<div class="small muted">${sum("duplicates")} rows were already imported and were skipped.</div>` : ""}
+      ${!sum("imported") && !income.length && results.every((r) => r.kind === "card") ? `<div class="alert info"><span class="ico">ℹ️</span><span>
+        ${results.map((r) => monthLabel(r.budget_month)).join(", ")} ${results.length > 1 ? "are" : "is"} already in your budget from your spreadsheet, so nothing was added
+        (that would count every purchase twice). ${sum("history_matched") ? `${sum("history_matched")} spreadsheet entries now show the card's merchant names and dates.` : "The spreadsheet entries were already matched to this statement earlier."}
+        You'll find them on the Transactions page under that month, marked <b>spreadsheet</b>.</span></div>` : ""}
+      ${sum("duplicates") ? `<div class="small muted">${sum("duplicates")} rows were already imported or matched earlier and were skipped.</div>` : ""}
       ${sum("history_skipped") ? `<div class="small muted">${sum("history_skipped")} rows fall in months your spreadsheet already covers but didn't match an entry there (e.g. card payments, transfers, or entries you combined) - they weren't added.</div>` : ""}
       <table class="small">${results.map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.account || "")}</td><td class="num">${r.imported} new</td><td class="num">${r.history_matched} matched to history</td></tr>`).join("")}</table>
     </div>`,
-    foot: `<button data-close>Close</button><button class="primary" data-go>Review new transactions</button>`,
+    foot: `<button data-close>Close</button><button class="primary" data-go>${sum("imported") ? "Review new transactions" : "Show transactions"}</button>`,
     onMount(root, close) {
       root.querySelector("[data-go]").onclick = () => {
-        const latest = Object.keys(months).sort().pop();
+        const latest = Object.keys(months).sort().pop() || results.map((r) => r.budget_month).filter(Boolean).sort().pop();
         if (latest && latest !== state.month) { state.month = latest; localStorage.setItem("month", latest); }
         close();
-        location.hash = "#/transactions?filter=uncategorized";
+        location.hash = sum("imported") ? "#/transactions?filter=uncategorized" : "#/transactions?filter=all";
         render();
       };
     },
@@ -356,7 +363,7 @@ export default {
           tgt.classList.toggle("uncat", !cid);
           tgt.closest("tr").querySelector("[data-review]")?.remove();
           tgt.closest("tr").querySelector(".badge.accent")?.remove();
-          if (cid) afterCategorize(tx, cid);
+          if (cid && !unnamed(tx)) afterCategorize(tx, cid);
           refreshBadge();
         } catch (err) { fail(err); }
       }

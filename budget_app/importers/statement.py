@@ -350,6 +350,9 @@ def import_statement(db, text, filename, account=None, budget_month=None):
             inc_month = month_add(month, offset)
             if _enrich_income(db, inc_month, t):
                 res["history_matched"] += 1
+            elif db.execute("SELECT 1 FROM income WHERE month = ? AND description = ? AND ABS(amount - ?) < 0.005",
+                            (inc_month, t["description"], t["amount"])).fetchone():
+                res["duplicates"] += 1   # matched or added on an earlier import
             elif inc_month <= last_hist:
                 res["history_skipped"] += 1
             elif db.execute("SELECT 1 FROM income WHERE date = ? AND ABS(amount - ?) < 0.005 AND description = ?",
@@ -364,6 +367,9 @@ def import_statement(db, text, filename, account=None, budget_month=None):
         if month <= last_hist:
             if not t["excluded"] and _enrich_txn(db, month, t, account, rules, stmt_map):
                 res["history_matched"] += 1
+            elif db.execute("SELECT 1 FROM transactions WHERE source = 'excel' AND budget_month = ? "
+                            "AND description = ? AND ABS(amount - ?) < 0.005", (month, t["description"], t["amount"])).fetchone():
+                res["duplicates"] += 1   # matched on an earlier import
             else:
                 res["history_skipped"] += 1
             continue

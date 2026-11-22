@@ -13,8 +13,10 @@ const STATUS = {
 function card(r) {
   const [label, cls] = STATUS[r.status] || [r.status, ""];
   const icon = r.source === "amazon" ? "📦" : r.source === "text" ? "📝" : r.source === "email" ? "✉️" : "🧾";
+  const extra = [r.n_charges > 1 ? `+ ${r.n_charges - 1} more charge${r.n_charges > 2 ? "s" : ""}` : "",
+    r.n_charges && r.n_shared > 0 ? `shared with ${r.n_shared} other receipt${r.n_shared > 1 ? "s" : ""}` : ""].filter(Boolean).join(" · ");
   const match = r.transaction_id
-    ? `<div class="small muted">↔ ${esc(r.txn_description)} · ${money(r.txn_amount)}</div>`
+    ? `<div class="small muted">${r.n_charges ? "↔" : "suggested:"} ${esc(r.txn_description)} · ${money(r.txn_amount)}${extra ? ` · ${extra}` : ""}</div>`
     : `<div class="small warn">Not matched to a card charge yet</div>`;
   return `<div class="receipt-card" data-open="${r.id}">
     <div class="row"><b>${icon} ${esc(r.merchant || r.filename || "Receipt")}</b><span class="spacer"></span><span class="badge ${cls}">${label}</span></div>
@@ -32,7 +34,17 @@ export async function openReceipt(id) {
   let r;
   try { r = await api(`/receipts/${id}`); } catch (e) { return fail(e); }
   let items = r.items.map((i) => ({ ...i }));
-  let chosen = r.transaction_id || null;
+  // The charge(s) this receipt goes on, and other receipts paid in the same charge.
+  const known = new Map();   // id -> charge, for everything shown
+  for (const o of r.candidates) for (const t of o.transactions) known.set(t.id, t);
+  for (const t of r.links) known.set(t.id, t);
+  if (r.transaction && !known.has(r.transaction.id)) known.set(r.transaction.id, r.transaction);
+  let picked = r.links.length ? r.links.map((t) => t.id) : r.transaction_id ? [r.transaction_id] : [];
+  let withReceipts = [];
+  if (!picked.length && r.suggested != null) picked = r.candidates[r.suggested].transactions.map((t) => t.id);
+  const suggested = !r.links.length && r.candidates.find((o) => o.transactions.length && o.transactions.every((t) => picked.includes(t.id)) && o.transactions.length === picked.length);
+  if (suggested) withReceipts = suggested.with_receipts.map((w) => w.id);
+  const withInfo = new Map(r.candidates.flatMap((o) => o.with_receipts).map((w) => [w.id, w]));
 
   const preview = r.stored_path
     ? (r.stored_path.toLowerCase().endsWith(".pdf")
@@ -43,13 +55,43 @@ export async function openReceipt(id) {
           <b>${esc(r.email.subject || "")}</b><pre>${esc(r.source_text || "")}</pre></div>`
       : `<div class="empty">${r.source === "amazon" ? "📦<br>Imported from your Amazon order history" : "📝<br>Entered as text"}</div>`;
 
-  const candHtml = (cands) => cands.length
-    ? cands.map((c) => `<div class="cand ${c.id === chosen ? "sel" : ""}" data-cand="${c.id}">
-        <input type="radio" name="cand" ${c.id === chosen ? "checked" : ""}>
-        <div><b>${esc(c.description)}</b><div class="small muted">${c.date} · ${esc(c.account || "")}</div></div>
-        <span class="spacer"></span><b>${money(c.amount)}</b>
-        ${c.score >= 85 ? `<span class="badge good">best match</span>` : ""}</div>`).join("")
-    : `<div class="muted small">No card charge with a similar amount and date. Import that month's statement first - or record it as a cash/debit purchase below.</div>`;
+  const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+  const chargeLine = (t) => `<div class="row" style="gap:8px"><div><b>${esc(t.description)}</b>
+      <div class="small muted">${esc(t.date)} · ${esc(t.account || "")}${t.covered ? ` · <span class="warn">${money(t.covered)} already explained by other receipts</span>` : ""}</div></div>
+      <span class="spacer"></span><b>${money(t.amount)}</b></div>`;
+  const optHtml = () => r.candidates.length
+    ? r.candidates.map((o, i) => {
+        const ids = o.transactions.map((t) => t.id);
+        const on = sameSet(ids, picked) && sameSet(o.with_receipts.map((w) => w.id), withReceipts);
+        const sumCharges = o.transactions.reduce((a, t) => a + t.amount, 0);
+        const sumReceipts = (r.total || 0) + o.with_receipts.reduce((a, w) => a + w.total, 0);
+        return `<div class="cand ${on ? "sel" : ""}" data-opt="${i}"><input type="radio" name="opt" ${on ? "checked" : ""}>
+          <div style="flex:1">
+            <div class="row" style="gap:6px;margin-bottom:4px"><span class="badge ${o.current ? "good" : o.score >= 90 ? "accent" : ""}">${esc(o.why)}</span>
+              ${o.transactions.length > 1 || o.with_receipts.length ? `<span class="small muted">${o.with_receipts.length
+                ? `this receipt ${money(r.total)} + ${o.with_receipts.map((w) => money(w.total)).join(" + ")} = ${money(sumReceipts)}`
+                : `${o.transactions.map((t) => money(t.amount)).join(" + ")} = ${money(sumCharges)}`} ✓</span>` : ""}</div>
+            ${o.transactions.map(chargeLine).join("")}
+            ${o.with_receipts.map((w) => `<div class="small" style="margin-top:3px">＋ together with <a href="javascript:void 0" data-openrec="${w.id}">receipt #${w.id}</a>
+              · ${esc(w.merchant || "")} ${esc(w.purchase_date || "")} · ${money(w.total)}${w.status === "parsed" ? ` <span class="badge warn">not reviewed yet</span>` : ""}</div>`).join("")}
+          </div></div>`;
+      }).join("")
+    : `<div class="muted small">No card charge with this exact amount or this store's name nearby. Import that month's statement first,
+        search for the charge below - or record it as a cash/debit purchase.</div>`;
+  const pickedHtml = () => {
+    if (!picked.length) return `<span class="muted small">Nothing picked yet.</span>`;
+    const charges = picked.map((id) => known.get(id)).filter(Boolean);
+    const sumC = charges.reduce((a, t) => a + t.amount, 0);
+    const sumR = (r.total || 0) + withReceipts.reduce((a, id) => a + (withInfo.get(id)?.total || 0), 0);
+    const diff = Math.round((sumC - sumR) * 100) / 100;
+    return `${charges.map((t) => `<span class="pill">${esc(t.date)} · ${esc(t.description.slice(0, 26))} · <b>${money(t.amount)}</b>
+        <button class="ghost small" data-unpick="${t.id}" title="Remove">✕</button></span>`).join("")}
+      ${withReceipts.length ? `<span class="small muted">with receipt${withReceipts.length > 1 ? "s" : ""} ${withReceipts.map((id) => `#${id}`).join(", ")}</span>` : ""}
+      <div class="small" style="margin-top:4px">${charges.length > 1 || withReceipts.length ? `Charges ${money(sumC)} · receipts ${money(sumR)} ` : ""}${
+        Math.abs(diff) < 0.01 ? `<span class="good">✓ adds up</span>`
+        : charges.length === 1 && !withReceipts.length ? `<span class="muted">charge is ${money(Math.abs(diff))} ${diff > 0 ? "more" : "less"} than the receipt (tip, or tax differences) - the categories are fitted to the charge</span>`
+        : `<span class="warn">${money(Math.abs(diff))} ${diff > 0 ? "of the charges isn't on these receipts - it stays uncategorized" : "more on the receipts than charged - shares are scaled down"}</span>`}</div>`;
+  };
 
   modal({
     title: `${r.source === "amazon" ? "Amazon order" : "Receipt"}${r.merchant ? " · " + r.merchant : ""}`,
@@ -74,11 +116,21 @@ export async function openReceipt(id) {
           <div class="row" style="margin-top:8px"><button class="small" data-additem>＋ Add item</button><span class="spacer"></span><span id="check" class="small"></span></div>
         </div>
         <div>
-          <h3 style="margin-bottom:8px">Card charge</h3>
-          ${r.transaction && state.status.spreadsheet_through && r.transaction.budget_month <= state.status.spreadsheet_through
-            ? `<div class="alert warn small" style="margin-bottom:8px"><span class="ico">⚠️</span><span>This charge is in ${esc(r.transaction.budget_month)}, a month your
-               spreadsheet covers. Splitting it changes that month's envelopes, so it won't match the spreadsheet any more.</span></div>` : ""}
-          <div id="cands">${candHtml(r.candidates)}</div>
+          <div class="row" style="margin-bottom:8px"><h3>Card charge</h3><span class="spacer"></span>
+            ${r.links.length ? `<button class="small" data-unapply title="Take this receipt off its charge(s); their categories stay as they are">Take off charge</button>` : ""}</div>
+          ${r.links.length ? `<div class="alert info small" style="margin-bottom:8px"><span class="ico">✓</span><div>Applied to ${r.links.map((t) =>
+              `<b>${esc(t.description)}</b> ${esc(t.date)} · ${money(t.amount)}${t.other_receipts.length ? ` (together with ${t.other_receipts.map((o) =>
+                `<a href="javascript:void 0" data-openrec="${o.id}">receipt #${o.id}</a> ${money(o.total)}`).join(", ")})` : ""}`).join("; ")}</div></div>` : ""}
+          <div id="sheet-warn"></div>
+          <div class="small muted" style="margin-bottom:6px">Suggestions match the exact amount or the store name. A receipt can go on several charges
+            (charged in parts), and several receipts can go on one charge.</div>
+          <div id="cands">${optHtml()}</div>
+          <div class="pick-box">
+            <div class="small" style="margin-bottom:4px"><b>Selected:</b></div><div id="picked">${pickedHtml()}</div>
+            <div class="row" style="margin-top:8px;gap:6px"><input id="charge-q" type="search" placeholder="Find another charge: store name or amount" style="flex:1">
+              <span class="small muted">click a result to add it</span></div>
+            <div id="charge-results"></div>
+          </div>
         </div>
       </div></div>`,
     foot: `<button class="danger" data-delete>Delete</button>
@@ -133,12 +185,51 @@ export async function openReceipt(id) {
         }
         check();
       });
+      const drawPick = () => {
+        root.querySelector("#cands").innerHTML = optHtml();
+        root.querySelector("#picked").innerHTML = pickedHtml();
+        const sheet = state.status.spreadsheet_through;
+        const inSheet = picked.map((id) => known.get(id)).filter((t) => t && sheet && t.budget_month <= sheet);
+        root.querySelector("#sheet-warn").innerHTML = inSheet.length
+          ? `<div class="alert warn small" style="margin-bottom:8px"><span class="ico">⚠️</span><span>${esc(inSheet.map((t) => t.budget_month).join(", "))} is a month your
+             spreadsheet covers. Splitting the charge changes that month's envelopes, so it won't match the spreadsheet any more.</span></div>` : "";
+      };
+      drawPick();
+      let searchTimer;
+      root.querySelector("#charge-q").addEventListener("input", (e) => {
+        clearTimeout(searchTimer);
+        const q = e.target.value.trim();
+        searchTimer = setTimeout(async () => {
+          const box = root.querySelector("#charge-results");
+          if (!q) { box.innerHTML = ""; return; }
+          try {
+            const res = await api(`/receipts/${r.id}/charges?q=${encodeURIComponent(q)}`);
+            res.forEach((t) => known.set(t.id, t));
+            box.innerHTML = res.length ? res.slice(0, 12).map((t) => `<div class="cand small" data-add="${t.id}">${chargeLine(t)}
+                <span class="badge">${picked.includes(t.id) ? "added" : "＋ add"}</span></div>`).join("")
+              : `<div class="muted small" style="margin-top:6px">No charges found.</div>`;
+          } catch (err) { fail(err); }
+        }, 250);
+      });
+
       root.addEventListener("click", async (e) => {
-        const c = e.target.closest("[data-cand]");
-        if (c) {
-          chosen = +c.dataset.cand;
-          root.querySelectorAll(".cand").forEach((x) => { x.classList.toggle("sel", +x.dataset.cand === chosen); x.querySelector("input").checked = +x.dataset.cand === chosen; });
+        const orc = e.target.closest("[data-openrec]");
+        if (orc) { close(); openReceipt(+orc.dataset.openrec); return; }
+        const o = e.target.closest("[data-opt]");
+        if (o) {
+          const opt = r.candidates[+o.dataset.opt];
+          picked = opt.transactions.map((t) => t.id);
+          withReceipts = opt.with_receipts.map((w) => w.id);
+          drawPick();
         }
+        const add = e.target.closest("[data-add]");
+        if (add && !picked.includes(+add.dataset.add)) {
+          picked.push(+add.dataset.add);
+          add.querySelector(".badge").textContent = "added";
+          drawPick();
+        }
+        const un = e.target.closest("[data-unpick]");
+        if (un) { picked = picked.filter((id) => id !== +un.dataset.unpick); if (!picked.length) withReceipts = []; drawPick(); }
         if (e.target.dataset.delitem !== undefined) { items.splice(+e.target.dataset.delitem, 1); drawItems(); }
         if (e.target.matches("[data-additem]")) { items.push({ name: "", quantity: 1, amount: 0, taxable: true, category_id: null }); drawItems(); }
       });
@@ -149,7 +240,7 @@ export async function openReceipt(id) {
           merchant: val("merchant"), purchase_date: val("purchase_date") || null,
           total: parseFloat(val("total")) || null, subtotal: parseFloat(val("subtotal")) || null, tax: parseFloat(val("tax")) || 0,
           items: items.map((i) => ({ ...i, amount: parseFloat(i.amount) || 0, quantity: parseFloat(i.quantity) || null })),
-          transaction_id: chosen,
+          ...(r.links.length ? {} : { transaction_id: picked[0] || null }),   // remembered as the suggestion
         };
         return api(`/receipts/${r.id}`, { method: "PATCH", body });
       };
@@ -164,13 +255,20 @@ export async function openReceipt(id) {
         } catch (e) { fail(e); }
       };
       root.querySelector("[data-apply]").onclick = async () => {
-        if (!chosen) return toast("Pick the card charge this receipt belongs to (or record it as cash/debit)", { error: true });
+        if (!picked.length) return toast("Pick the card charge(s) this receipt belongs to (or record it as cash/debit)", { error: true });
         if (items.some((i) => !i.category_id) && !confirm("Some items have no category - their share will stay uncategorized. Continue?")) return;
         try {
           await save();
-          await api(`/receipts/${r.id}/apply`, { method: "POST", body: { transaction_id: chosen } });
-          close(); toast("Charge split by category ✓"); render();
+          await api(`/receipts/${r.id}/apply`, { method: "POST", body: { transaction_ids: picked, with_receipts: withReceipts } });
+          close();
+          toast(`${picked.length > 1 ? `${picked.length} charges` : "Charge"} split by category ✓${withReceipts.length ? ` · together with ${withReceipts.length} other receipt${withReceipts.length > 1 ? "s" : ""}` : ""}`);
+          render();
         } catch (e) { fail(e); }
+      };
+      const ua = root.querySelector("[data-unapply]");
+      if (ua) ua.onclick = async () => {
+        if (!confirm("Take this receipt off its charge(s)? Charges that still have other receipts are re-split; otherwise their categories stay as they are.")) return;
+        try { await api(`/receipts/${r.id}/unapply`, { method: "POST" }); close(); openReceipt(r.id); render(); } catch (e) { fail(e); }
       };
       root.querySelector("[data-cash]").onclick = async () => {
         const account = prompt("Paid with (account name):", "Debit card");

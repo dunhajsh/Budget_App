@@ -25,7 +25,8 @@ function catCell(t) {
 function row(t) {
   const monthTag = t.date.slice(0, 7) !== t.budget_month ? `<span class="badge" title="Counts toward ${monthLabel(t.budget_month)}">→ ${monthLabel(t.budget_month, true)}</span>` : "";
   const auto = !t.reviewed && !t.excluded && t.splits.length ? `<span class="badge accent" title="Auto-categorized - click ✓ to confirm">auto</span>` : "";
-  const receipt = t.receipt_id ? `<a class="badge good" href="#/receipts?open=${t.receipt_id}" title="Itemized from a receipt">🧾 receipt</a>` : "";
+  const receipt = t.receipt_id
+    ? `<a class="badge ${t.receipt_count ? "good" : ""}" href="#/receipts?open=${t.receipt_id}" title="${t.receipt_count ? `Itemized from ${t.receipt_count > 1 ? `${t.receipt_count} receipts` : "a receipt"}` : "A receipt is waiting to be applied to this charge"}">🧾 ${t.receipt_count > 1 ? `${t.receipt_count} receipts` : t.receipt_count ? "receipt" : "receipt to apply"}</a>` : "";
   const sheet = t.source === "excel" ? `<span class="badge" title="From your budget spreadsheet${unnamed(t) ? "" : " - merchant name and date from your card/bank statement"}">spreadsheet</span>` : "";
   return `<tr data-id="${t.id}" class="${t.excluded ? "excluded" : ""}">
     <td><input type="checkbox" data-sel="${t.id}" ${selected.has(t.id) ? "checked" : ""}></td>

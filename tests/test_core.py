@@ -463,6 +463,31 @@ class ReceiptReadingTests(unittest.TestCase):
         self.assertEqual(len(r["items"]), 9)
         self.assertIsNone(parse(MEIJER_TEXT.replace("42.69", "50.00")))   # doesn't add up -> AI fallback
 
+    def test_meijer_order_coupons_are_their_own_line(self):
+        from budget_app.importers.receipt_text import parse
+        from budget_app.receipts import file_coupons
+        base = MEIJER_TEXT.split(" => 15.00 off")[0]   # up to the chicken
+        tail = "            mPerks # -- ********27\nTOTAL\n             TOTAL TAX             .80\n             TOTAL               {}\n"
+        # basket coupon after a blank line: not taken off the chicken
+        r = parse(base + " \n Total Basket Coupon\n => 20.00 off                   -20.00\n \n" + tail.format("27.69"))
+        self.assertEqual(r["items"][-2]["amount"], 6.99)
+        self.assertEqual((r["items"][-1]["name"], r["items"][-1]["amount"], r["items"][-1]["coupon"]), ("Coupon", -20.0, True))
+        # offer bigger than the item above it, no blank line: still the whole order
+        r = parse(base + "     mPerks Offer\n => 8.00 off                    -8.00\n" + tail.format("39.69"))
+        self.assertEqual((r["items"][-2]["amount"], r["items"][-1]["amount"]), (6.99, -8.0))
+        # an item discount right under the item still comes off that item
+        r = parse(base + "     mPerks Offer\n => .75 off                     -.75   N\n" + tail.format("46.94"))
+        self.assertEqual(r["items"][-1]["amount"], 6.24)
+        # an unfiled coupon goes to the envelope most of the receipt went to
+        items = [{"name": "Beef", "amount": 20, "category_id": 2}, {"name": "Tape", "amount": 5, "category_id": 3},
+                 {"name": "Coupon", "amount": -5, "category_id": 0, "coupon": True}]
+
+        class FakeDB:
+            def execute(self, q):
+                return [{"id": 1, "parent_id": None}, {"id": 2, "parent_id": 1}, {"id": 3, "parent_id": None}]
+        file_coupons(FakeDB(), items)
+        self.assertEqual(items[-1]["category_id"], 1)
+
     def test_amazon_new_export_uses_charged_amounts_per_shipment(self):
         ships = amazon.parse_shipments([AMAZON_NEW])
         totals = sorted((s["order_id"], s["total"]) for s in ships)
@@ -556,6 +581,93 @@ class ItemMemoryTests(unittest.TestCase):
         items = [{"name": "GR BEEF", "amount": 5}, {"name": "Bandages", "amount": 2}]
         self.assertIsNone(receipts.categorize_items(self.db, items, "Meijer"))   # AI off: nothing else to do
         self.assertEqual([i["category_id"] for i in items], [1, 3])
+
+
+class ReceiptMatchingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.app = create_app(data_dir=self.tmp, testing=True)
+        self.db = connect(os.path.join(self.tmp, "budget.db"))
+        self.db.execute("INSERT INTO categories(id, name) VALUES (1, 'Health'), (2, 'Beauty'), (3, 'Food')")
+        self.db.commit()
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def charge(self, d, desc, amount):
+        return self.db.execute("""INSERT INTO transactions(date, description, merchant, amount, source, budget_month)
+                                  VALUES (?, ?, ?, ?, 'statement', ?)""", (d, desc, desc, amount, d[:7])).lastrowid
+
+    def receipt(self, d, merchant, items, ext=None, source="upload", tax=0):
+        from budget_app import receipts
+        total = round(sum(i["amount"] for i in items) + tax, 2)
+        rid = self.db.execute("""INSERT INTO receipts(source, external_id, merchant, purchase_date, subtotal, tax, total, status)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, 'reviewed')""", (source, ext, merchant, d, total - tax, tax, total)).lastrowid
+        receipts.save_items(self.db, rid, items)
+        return rid
+
+    def splits(self, tid):
+        return sorted((s["category_id"], s["amount"]) for s in self.db.execute("SELECT * FROM splits WHERE transaction_id = ?", (tid,)))
+
+    def test_only_exact_amount_or_same_store_is_suggested(self):
+        from budget_app import matching
+        rid = self.receipt("2026-10-05", "Corner Grocer", [{"name": "Bread", "amount": 24.50, "category_id": 3}])
+        exact = self.charge("2026-10-06", "CORNER GROCER #12", 24.50)
+        self.charge("2026-10-07", "STREAMING SVC", 24.51)          # a cent off, other store: not suggested
+        same_store = self.charge("2026-10-09", "CORNER GROCER #12", 55.00)
+        self.charge("2026-10-08", "GAS STATION", 25.00)            # neither: not suggested
+        opts = matching.candidates(self.db, rid)
+        self.assertEqual([o["transactions"][0]["id"] for o in opts], [exact, same_store])
+        self.assertEqual(opts[0]["why"], "Same amount and store")
+        self.assertEqual(matching.best(self.db, rid)["transactions"][0]["id"], exact)
+
+    def test_two_shipments_of_one_order_charged_together(self):
+        from budget_app import matching, receipts
+        a = self.receipt("2026-10-01", "Amazon", [{"name": "Vitamins", "amount": 12.00, "category_id": 1},
+                                                  {"name": "Lotion", "amount": 8.00, "category_id": 2}],
+                         ext="amazon|111-1|2026-10-01|BOX1", source="amazon")
+        b = self.receipt("2026-10-01", "Amazon", [{"name": "Fish oil", "amount": 5.50, "category_id": 1}],
+                         ext="amazon|111-1|2026-10-01|BOX2", source="amazon")
+        self.receipt("2026-09-28", "Amazon", [{"name": "Snacks", "amount": 5.50, "category_id": 3}],
+                     ext="amazon|999-9|2026-09-28|BOX9", source="amazon")   # same amount, other order: never combined
+        tid = self.charge("2026-10-01", "AMAZON MKTPL*TEST0001", 25.50)
+        self.db.commit()
+        top = matching.candidates(self.db, a)[0]
+        self.assertEqual((top["why"], [t["id"] for t in top["transactions"]], [w["id"] for w in top["with_receipts"]]),
+                         ("Same Amazon order, charged together", [tid], [b]))
+        with self.app.test_client() as c:
+            c.post(f"/api/receipts/{a}/apply", json={"transaction_ids": [tid], "with_receipts": [b]})
+            r = c.get(f"/api/receipts/{a}").get_json()
+        self.assertEqual(self.splits(tid), [(1, 17.5), (2, 8.0)])   # both receipts' items, adding up to the charge
+        self.assertEqual(len(r["links"]), 1)
+        self.assertEqual([o["id"] for o in r["links"][0]["other_receipts"]], [b])
+        # taking one receipt off re-splits the charge from the one left (fitted to the whole charge)
+        receipts.unapply(self.db, b)
+        self.assertEqual(round(sum(v for _, v in self.splits(tid)), 2), 25.50)
+        self.assertEqual(self.db.execute("SELECT status FROM receipts WHERE id = ?", (b,)).fetchone()[0], "reviewed")
+
+    def test_one_receipt_charged_in_parts(self):
+        from budget_app import matching, receipts
+        rid = self.receipt("2026-10-10", "Hardware Barn", [{"name": "Lumber", "amount": 80, "category_id": 3},
+                                                           {"name": "Bandages", "amount": 20, "category_id": 1}])
+        t1 = self.charge("2026-10-10", "HARDWARE BARN 22", 60.00)
+        t2 = self.charge("2026-10-12", "HARDWARE BARN 22", 40.00)
+        parts = [o for o in matching.candidates(self.db, rid) if o["kind"] == "parts"]
+        self.assertEqual(sorted(t["id"] for t in parts[0]["transactions"]), [t1, t2])
+        receipts.apply(self.db, rid, [t1, t2])
+        self.assertEqual(self.splits(t1), [(1, 12.0), (3, 48.0)])     # each charge gets its share of every item
+        self.assertEqual(self.splits(t2), [(1, 8.0), (3, 32.0)])
+
+    def test_missing_receipt_leaves_the_rest_uncategorized(self):
+        from budget_app import receipts
+        a = self.receipt("2026-10-01", "Amazon", [{"name": "Vitamins", "amount": 20.00, "category_id": 1}], ext="amazon|1|x|A", source="amazon")
+        b = self.receipt("2026-10-01", "Amazon", [{"name": "Lotion", "amount": 5.50, "category_id": 2}], ext="amazon|1|x|B", source="amazon")
+        tid = self.charge("2026-10-01", "AMAZON MKTPL*X", 25.50)
+        receipts.apply(self.db, a, tid)          # one receipt alone on the charge: fitted to it
+        self.assertEqual(self.splits(tid), [(1, 25.5)])
+        receipts.apply(self.db, b, tid)          # now both
+        self.assertEqual(self.splits(tid), [(1, 20.0), (2, 5.5)])
 
 
 class LocalModelTests(unittest.TestCase):
@@ -803,9 +915,13 @@ class ApiSmokeTests(unittest.TestCase):
                                                    "items": [{"name": "Apples", "amount": 40, "taxable": False, "category_id": food["id"]},
                                                              {"name": "Soap", "amount": 6.54, "taxable": True, "category_id": fun["id"]}]})
         cands = self.c.get(f"/api/receipts/{rid}").get_json()["candidates"]
-        self.assertTrue(cands and cands[0]["amount"] == 47.04)
-        r = self.c.post(f"/api/receipts/{rid}/apply", json={"transaction_id": cands[0]["id"]})
+        self.assertTrue(cands and cands[0]["transactions"][0]["amount"] == 47.04)
+        r = self.c.post(f"/api/receipts/{rid}/apply", json={"transaction_ids": [cands[0]["transactions"][0]["id"]]})
         self.assertEqual(r.status_code, 200)
+        found = self.c.get(f"/api/receipts/{rid}/charges?q=47.04").get_json()
+        self.assertEqual(found[0]["amount"], 47.04)
+        self.assertEqual(self.c.post(f"/api/receipts/{rid}/unapply").status_code, 200)
+        self.c.post(f"/api/receipts/{rid}/apply", json={"transaction_id": cands[0]["transactions"][0]["id"]})   # old form still works
         t = self.c.get("/api/transactions?month=2026-10&filter=split").get_json()
         self.assertEqual(len(t), 2)
         # budget endpoints

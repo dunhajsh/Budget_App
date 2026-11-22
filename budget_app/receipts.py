@@ -7,17 +7,6 @@ from datetime import date
 from . import ai, itemmemory
 
 
-def _d(s):
-    try:
-        return date.fromisoformat((s or "")[:10])
-    except ValueError:
-        return None
-
-
-def _tokens(s):
-    return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(t) > 2 and t not in {"the", "inc", "com", "store", "llc"}}
-
-
 def get(db, rid):
     r = db.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
     if not r:
@@ -28,6 +17,15 @@ def get(db, rid):
     if r["transaction_id"]:
         t = db.execute("SELECT * FROM transactions WHERE id = ?", (r["transaction_id"],)).fetchone()
         r["transaction"] = dict(t) if t else None
+    # the charges it's applied to, and any other receipts sharing them
+    r["links"] = []
+    for t in db.execute("""SELECT t.* FROM receipt_links l JOIN transactions t ON t.id = l.transaction_id
+                           WHERE l.receipt_id = ? ORDER BY t.date, t.id""", (rid,)):
+        t = dict(t)
+        t["other_receipts"] = [dict(o) for o in db.execute(
+            """SELECT r.id, r.merchant, r.purchase_date, r.total FROM receipt_links l JOIN receipts r ON r.id = l.receipt_id
+               WHERE l.transaction_id = ? AND r.id != ?""", (t["id"], rid))]
+        r["links"].append(t)
     raw = json.loads(r.pop("raw_json", None) or "{}")
     r["email"] = raw.get("email")
     if r["source"] == "email":
@@ -77,19 +75,37 @@ def categorize_items(db, items, store=""):
     """Fill in category_id for items read without AI: items you've filed before first (item memory),
     then one AI call for the rest. Returns an error message if the AI couldn't be reached."""
     itemmemory.apply(db, items)
-    todo = [i for i in items if not i.get("category_id")]
-    if not todo or not ai.enabled(db):
-        return None
-    try:
-        res = ai.categorize(db, [f"{i['name']} ({store}{', ' + i['department'].lower() + ' aisle' if i.get('department') else ''})"
-                                 for i in todo], kind=f"{store} receipt items".strip())
-    except ai.AIError as e:
-        return str(e)
-    for idx, cid in res.items():
-        if 0 <= idx < len(todo):
-            todo[idx]["category_id"] = cid
-            todo[idx]["cat_source"] = "ai"
-    return None
+    todo = [i for i in items if not i.get("category_id") and not i.get("coupon")]
+    err = None
+    if todo and ai.enabled(db):
+        try:
+            res = ai.categorize(db, [f"{i['name']} ({store}{', ' + i['department'].lower() + ' aisle' if i.get('department') else ''})"
+                                     for i in todo], kind=f"{store} receipt items".strip())
+            for idx, cid in res.items():
+                if 0 <= idx < len(todo):
+                    todo[idx]["category_id"] = cid
+                    todo[idx]["cat_source"] = "ai"
+        except ai.AIError as e:
+            err = str(e)
+    file_coupons(db, items)
+    return err
+
+
+def file_coupons(db, items):
+    """A coupon on the whole order (not filed before) goes to the envelope most of the receipt was spent in."""
+    coupons = [i for i in items if i.get("coupon") and not i.get("category_id")]
+    if not coupons:
+        return
+    env = {r["id"]: r["parent_id"] or r["id"] for r in db.execute("SELECT id, parent_id FROM categories")}
+    spent = {}
+    for i in items:
+        if i.get("category_id") and not i.get("coupon"):
+            e = env.get(i["category_id"], i["category_id"])
+            spent[e] = spent.get(e, 0) + (i.get("amount") or 0)
+    if spent:
+        top = max(spent, key=spent.get)
+        for c in coupons:
+            c["category_id"], c["cat_source"] = top, "ai"
 
 
 def run_parse(db, rid, data=None, media_type=None, text=None, email=None):
@@ -204,50 +220,17 @@ class Worker:
 WORKER = Worker()
 
 
-def candidates(db, rid, limit=8):
-    """Card transactions that could be this receipt, best first."""
-    r = db.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
-    if not r or r["total"] is None:
-        return []
-    total, rdate = float(r["total"]), _d(r["purchase_date"])
-    rtok = _tokens(r["merchant"])
-    q = """SELECT t.* FROM transactions t
-           WHERE t.excluded = 0 AND t.source IN ('statement', 'manual') AND t.amount > 0
-             AND t.amount BETWEEN ? AND ?
-             AND t.id NOT IN (SELECT transaction_id FROM receipts WHERE transaction_id IS NOT NULL AND id != ?)"""
-    args = [total * 0.75 - 0.02, total * 1.35 + 0.02, rid]
-    if rdate:
-        q += " AND t.date BETWEEN date(?, '-10 day') AND date(?, '+10 day')"
-        args += [rdate.isoformat(), rdate.isoformat()]
-    out = []
-    for t in db.execute(q, args):
-        t = dict(t)
-        diff = abs(t["amount"] - total)
-        score = 60 if diff <= 0.011 else 35 if diff <= total * 0.02 else 12
-        td = _d(t["date"])
-        if rdate and td:
-            days = abs((td - rdate).days)
-            score += 25 if days <= 1 else 18 if days <= 3 else 8 if days <= 7 else 0
-        else:
-            score += 8
-        overlap = rtok & _tokens(t["description"])
-        if overlap:
-            score += 15
-        elif rtok and r["merchant"]:
-            score -= 10
-        t["score"] = score
-        out.append(t)
-    out.sort(key=lambda t: (-t["score"], t["date"]))
-    return out[:limit]
+def candidates(db, rid, limit=10):
+    """Ways this receipt could be paid (see matching.candidates)."""
+    from . import matching
+    return matching.candidates(db, rid, limit)
 
 
 def best_match(db, rid):
-    c = candidates(db, rid, limit=3)
-    if not c:
-        return None
-    if c[0]["score"] >= 85 and (len(c) == 1 or c[1]["score"] <= c[0]["score"] - 15):
-        return c[0]
-    return None
+    """The charge to suggest for a receipt (the first one, if it's paid in parts), or None."""
+    from . import matching
+    o = matching.best(db, rid)
+    return o["transactions"][0] if o else None
 
 
 def compute_splits(items, tax, target_total):
@@ -278,26 +261,76 @@ def compute_splits(items, tax, target_total):
     return [tuple(x) for x in result if abs(x[1]) >= 0.005 or len(result) == 1]
 
 
-def apply(db, rid, txn_id):
-    """Link receipt to transaction and replace its splits with the receipt's category breakdown."""
-    r = db.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
-    t = db.execute("SELECT * FROM transactions WHERE id = ?", (txn_id,)).fetchone()
-    if not r or not t:
-        raise ValueError("Receipt or transaction not found")
-    items = [dict(i) for i in db.execute("SELECT * FROM receipt_items WHERE receipt_id = ?", (rid,))]
-    # Amazon exports already include tax in each line
-    tax = 0 if r["source"] == "amazon" else (r["tax"] or 0)
-    splits = compute_splits(items, tax, t["amount"])
-    db.execute("UPDATE receipts SET transaction_id = NULL WHERE transaction_id = ? AND id != ?", (txn_id, rid))
-    db.execute("DELETE FROM splits WHERE transaction_id = ?", (txn_id,))
-    for cid, amt, n in splits:
-        db.execute(
-            "INSERT INTO splits(transaction_id, category_id, amount, memo) VALUES (?, ?, ?, ?)",
-            (txn_id, cid, amt, f"Receipt: {n} item{'s' if n != 1 else ''}"),
-        )
-    db.execute("UPDATE transactions SET reviewed = 1 WHERE id = ?", (txn_id,))
-    db.execute("UPDATE receipts SET transaction_id = ?, status = 'applied' WHERE id = ?", (txn_id, rid))
-    return splits
+def apply(db, rid, txn_ids):
+    """Apply a receipt to one charge or several (it was charged in parts), replacing what it was applied
+    to before. Other receipts already applied to the same charge stay on it (several receipts, one
+    charge). Each charge involved is re-split by category. Returns the splits of the first charge."""
+    from . import matching
+    if not db.execute("SELECT 1 FROM receipts WHERE id = ?", (rid,)).fetchone():
+        raise ValueError("Receipt not found")
+    ids = [txn_ids] if isinstance(txn_ids, int) else list(txn_ids)
+    if not ids:
+        raise ValueError("Pick the card charge(s) this receipt belongs to")
+    matching.set_links(db, rid, ids)
+    return [(s["category_id"], s["amount"]) for s in db.execute("SELECT * FROM splits WHERE transaction_id = ?", (ids[0],))]
+
+
+def unapply(db, rid):
+    """Take a receipt off its charge(s). Charges still holding other receipts are re-split; a charge left
+    with none keeps its current categories."""
+    from . import matching
+    matching.set_links(db, rid, [])
+
+
+def rebuild_splits(db, tid):
+    """Split a charge by category from every receipt applied to it.
+
+    Each receipt contributes its share of the charge (see matching._share), broken down by its items
+    (tax spread over taxable items). If the receipts explain the charge to within 10 cents / 1% the
+    difference is spread proportionally; if they explain clearly less, the rest stays uncategorized
+    ("Not on the linked receipts") so you can see a receipt is missing; if more, they're scaled down."""
+    from . import matching
+    t = db.execute("SELECT * FROM transactions WHERE id = ?", (tid,)).fetchone()
+    rids = matching.receipts_of(db, tid)
+    if not t or not rids:
+        return []
+    amount = float(t["amount"])
+    single = len(rids) == 1 and len(matching.links_of(db, rids[0])) == 1
+    raw, counts, explained = defaultdict(float), defaultdict(int), 0.0
+    for rid in rids:
+        r = db.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
+        items = [dict(i) for i in db.execute("SELECT * FROM receipt_items WHERE receipt_id = ?", (rid,))]
+        share = amount if single else matching._share(db, rid, tid)   # one receipt, one charge: fit it to the charge
+        tax = 0 if r["source"] == "amazon" else (r["tax"] or 0)       # Amazon lines already include tax
+        for cid, amt, n in compute_splits(items, tax, share):
+            raw[cid] += amt
+            counts[cid] += n
+        explained += share
+    rest = round(amount - explained, 2)
+    if rest > max(0.10, amount * 0.01):
+        raw[("rest",)] += rest
+    else:
+        factor = amount / explained if explained else 1
+        for k in raw:
+            raw[k] *= factor
+    result = [[k, round(v, 2)] for k, v in raw.items()]
+    residual = round(amount - sum(v for _, v in result), 2)
+    if result and residual:
+        max(result, key=lambda x: abs(x[1]))[1] = round(max(result, key=lambda x: abs(x[1]))[1] + residual, 2)
+    db.execute("DELETE FROM splits WHERE transaction_id = ?", (tid,))
+    label = f"{len(rids)} receipts" if len(rids) > 1 else "Receipt"
+    for k, v in result:
+        if abs(v) < 0.005 and len(result) > 1:
+            continue
+        if k == ("rest",):
+            db.execute("INSERT INTO splits(transaction_id, category_id, amount, memo) VALUES (?, NULL, ?, ?)",
+                       (tid, v, "Not on the linked receipts"))
+        else:
+            n = counts[k]
+            db.execute("INSERT INTO splits(transaction_id, category_id, amount, memo) VALUES (?, ?, ?, ?)",
+                       (tid, k, v, f"{label}: {n} item{'s' if n != 1 else ''}"))
+    db.execute("UPDATE transactions SET reviewed = 1 WHERE id = ?", (tid,))
+    return result
 
 
 def create_transaction_from(db, rid, account="Cash", budget_month=None):

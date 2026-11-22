@@ -253,3 +253,26 @@ textarea { width: 100%; min-height: 90px; resize: vertical; }
 details > summary { cursor: pointer; color: var(--muted); }
 code { font-size: 12px; background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
 .alert.warn { background: var(--warn-soft); }
+
+/* spending breakdown */
+tr.clickable { cursor: pointer; }
+tr.selected td { background: var(--accent-soft); }
+.hbar { position: relative; height: 10px; border-radius: 99px; background: var(--panel-2); border: 1px solid var(--border); min-width: 80px; }
+.hbar > span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); border-radius: 99px; }
+.hbar > em { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--text); border-radius: 1px; }
+.swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 7px; vertical-align: -1px; }
+.swatch.hatched { background: repeating-linear-gradient(135deg, var(--panel-2) 0 2px, var(--muted) 2px 3.5px); border: 1px solid var(--border); }
+.sp-matrix td.cell { cursor: pointer; }
+.sp-matrix td.cell:hover { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sp-matrix .focus { box-shadow: inset 1px 0 var(--accent), inset -1px 0 var(--accent); }
+.sp-matrix td.cat a { color: inherit; text-decoration: none; }
+.sp-matrix td.cat a:hover { color: var(--accent); }
+.spark { vertical-align: middle; }
+tr.buys > td { background: var(--panel-2); padding: 4px 10px 10px 24px; }
+tr.buys .matrix td { border-bottom: 0; padding: 3px 8px; }
+.kpi .value .good, .kpi .value .bad { font-size: 20px; }button[data-why] { white-space: nowrap; }
+.cand .row { flex-wrap: nowrap; }
+.pick-box { margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 10px; }
+.pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 10px; margin: 0 6px 4px 0; border-radius: 99px;
+  background: var(--accent-soft); font-size: 12.5px; }
+#charge-results .cand { margin-top: 6px; }

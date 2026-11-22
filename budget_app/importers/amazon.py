@@ -10,6 +10,7 @@ Amazon charges the card once per *shipment*, so items are grouped by
 """
 import csv
 import io
+import re
 import zipfile
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
@@ -192,4 +193,36 @@ def match_amazon(db, rids=None):
         else:
             db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (t["id"], r["id"]))
         matched += 1
+
+    # An order shipped in several boxes but charged once: its shipments add up to one charge.
+    by_order = {}
+    for r in pending:
+        if not db.execute("SELECT transaction_id FROM receipts WHERE id = ?", (r["id"],)).fetchone()[0]:
+            m = re.match(r"amazon\|([^|]+)\|", r["external_id"] or "")
+            if m:
+                by_order.setdefault(m.group(1), []).append(r)
+    for order, ships in by_order.items():
+        if len(ships) < 2:
+            continue
+        total = round(sum(s["total"] for s in ships), 2)
+        first = min(date.fromisoformat(s["purchase_date"]) for s in ships)
+        last = max(date.fromisoformat(s["purchase_date"]) for s in ships)
+        cands = [c for c in db.execute(
+            """SELECT * FROM transactions WHERE excluded = 0 AND source = 'statement'
+                 AND (UPPER(description) LIKE '%AMAZON%' OR UPPER(description) LIKE '%AMZN%')
+                 AND ABS(amount - ?) < 0.015 AND date BETWEEN ? AND ? ORDER BY date""",
+            (total, (first - timedelta(days=3)).isoformat(), (last + timedelta(days=10)).isoformat())) if c["id"] not in used]
+        if not cands:
+            continue
+        t = cands[0]
+        used.add(t["id"])
+        ok = (not t["reviewed"] and t["budget_month"] > (last_sheet or "")
+              and not db.execute(f"""SELECT 1 FROM receipt_items WHERE category_id IS NULL
+                                     AND receipt_id IN ({','.join('?' * len(ships))})""", [s["id"] for s in ships]).fetchone())
+        for s in ships:
+            if ok:
+                receipts.apply(db, s["id"], t["id"])
+            else:
+                db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (t["id"], s["id"]))
+            matched += 1
     return matched

@@ -9,7 +9,7 @@ from datetime import date, datetime
 from flask import Blueprint, abort, current_app, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
-from . import ai, emailscan, itemmemory, receipts
+from . import ai, emailscan, itemmemory, matching, receipts, spending
 from .budget import categories_tree, history, month_add, month_summary
 from .categorize import (apply_rules_to_uncategorized, find_category, merchant_key, set_single_category,
                          upsert_rule)
@@ -225,12 +225,29 @@ def report_category(cid):
     return jsonify(subcategories=subs, top_items=items)
 
 
+@bp.get("/reports/spending")
+def report_spending():
+    end = _month(request.args.get("end"))
+    start = _month(request.args.get("start") or month_add(end, -11))
+    return jsonify(spending.overview(get_db(), start, end))
+
+
+@bp.get("/reports/spending/<int:cid>")
+def report_spending_detail(cid):
+    end = _month(request.args.get("end"))
+    start = _month(request.args.get("start") or end)
+    ids = [int(x) for x in (request.args.get("ids") or "").split(",") if x.strip().isdigit()]
+    return jsonify(spending.detail(get_db(), cid, start, end, only_own=request.args.get("own") == "1", only_ids=ids or None))
+
+
 # ------------------------------------------------------------------ transactions
 
 def _txn_rows(db, where, args, limit=2000):
     q = f"""SELECT t.*, (SELECT json_group_array(json_object('id', s.id, 'category_id', s.category_id,
                         'amount', s.amount, 'memo', s.memo)) FROM splits s WHERE s.transaction_id = t.id) AS splits_json,
-                   (SELECT r.id FROM receipts r WHERE r.transaction_id = t.id LIMIT 1) AS receipt_id
+                   COALESCE((SELECT l.receipt_id FROM receipt_links l WHERE l.transaction_id = t.id ORDER BY l.receipt_id LIMIT 1),
+                            (SELECT r.id FROM receipts r WHERE r.transaction_id = t.id LIMIT 1)) AS receipt_id,
+                   (SELECT COUNT(*) FROM receipt_links l WHERE l.transaction_id = t.id) AS receipt_count
             FROM transactions t WHERE {where} ORDER BY t.date DESC, t.id DESC LIMIT {int(limit)}"""
     out = []
     for r in db.execute(q, args):
@@ -346,11 +363,25 @@ def similar(tid):
     return jsonify(merchant=t["merchant"], count=len(_similar_ids(db, t)))
 
 
+def _after_charges_removed(db, rids):
+    """Receipts that lost a charge: point them at a remaining one, or back to reviewed."""
+    for rid in rids:
+        left = matching.links_of(db, rid)
+        if left:
+            db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (left[0], rid))
+            for t in left:
+                receipts.rebuild_splits(db, t)
+        else:
+            db.execute("UPDATE receipts SET transaction_id = NULL, status = 'reviewed' WHERE id = ? AND status = 'applied'", (rid,))
+
+
 @bp.delete("/transactions/<int:tid>")
 def delete_transaction(tid):
     db = get_db()
-    db.execute("UPDATE receipts SET transaction_id = NULL, status = 'parsed' WHERE transaction_id = ?", (tid,))
+    hit = matching.receipts_of(db, tid)
+    db.execute("UPDATE receipts SET transaction_id = NULL WHERE transaction_id = ?", (tid,))
     db.execute("DELETE FROM transactions WHERE id = ?", (tid,))
+    _after_charges_removed(db, hit)
     db.commit()
     return jsonify(ok=True)
 
@@ -454,10 +485,13 @@ def list_batches():
 @bp.delete("/import/batches/<int:bid>")
 def undo_batch(bid):
     db = get_db()
-    db.execute("UPDATE receipts SET transaction_id = NULL, status = 'parsed' WHERE transaction_id IN "
+    hit = [r["receipt_id"] for r in db.execute(
+        "SELECT DISTINCT receipt_id FROM receipt_links WHERE transaction_id IN (SELECT id FROM transactions WHERE batch_id = ?)", (bid,))]
+    db.execute("UPDATE receipts SET transaction_id = NULL WHERE transaction_id IN "
                "(SELECT id FROM transactions WHERE batch_id = ?)", (bid,))
     db.execute("UPDATE transactions SET excluded = 0, replaced_by = NULL WHERE replaced_by = ?", (bid,))
     n = db.execute("DELETE FROM transactions WHERE batch_id = ?", (bid,)).rowcount
+    _after_charges_removed(db, hit)
     n += db.execute("DELETE FROM income WHERE batch_id = ?", (bid,)).rowcount
     db.execute("DELETE FROM import_batches WHERE id = ?", (bid,))
     db.commit()
@@ -759,6 +793,8 @@ def list_receipts():
     q = f"""SELECT r.id, r.source, r.filename, r.merchant, r.purchase_date, r.total, r.tax, r.status, r.error,
                    r.transaction_id, r.created_at, t.description AS txn_description, t.amount AS txn_amount,
                    t.date AS txn_date,
+                   (SELECT COUNT(*) FROM receipt_links l WHERE l.receipt_id = r.id) AS n_charges,
+                   (SELECT COUNT(*) - 1 FROM receipt_links l WHERE l.transaction_id = r.transaction_id) AS n_shared,
                    (SELECT COUNT(*) FROM receipt_items i WHERE i.receipt_id = r.id) AS item_count,
                    (SELECT COUNT(*) FROM receipt_items i WHERE i.receipt_id = r.id AND i.category_id IS NULL) AS uncategorized
             FROM receipts r LEFT JOIN transactions t ON t.id = r.transaction_id
@@ -806,6 +842,13 @@ def get_receipt(rid):
     if not r:
         abort(404)
     r["candidates"] = receipts.candidates(db, rid)
+    # a clear winner is pre-selected when nothing is applied or picked yet
+    r["suggested"] = None
+    if not r["links"] and not r["transaction_id"]:
+        b = matching.best(db, rid)
+        if b:
+            key = lambda o: (sorted(t["id"] for t in o["transactions"]), sorted(w["id"] for w in o["with_receipts"]))
+            r["suggested"] = next((i for i, o in enumerate(r["candidates"]) if key(o) == key(b)), None)
     return jsonify(r)
 
 
@@ -882,12 +925,30 @@ def apply_receipt(rid):
         tid = receipts.create_transaction_from(db, rid, account=b.get("account") or "Cash",
                                                budget_month=b.get("budget_month"))
     else:
-        tid = int(b.get("transaction_id") or 0)
-        if not tid:
-            raise ValueError("Pick the card transaction this receipt belongs to")
-        receipts.apply(db, rid, tid)
+        # one charge or several (charged in parts); with_receipts: other receipts paid in the same charge
+        ids = [int(x) for x in (b.get("transaction_ids") or [b.get("transaction_id")]) if x]
+        if not ids:
+            raise ValueError("Pick the card charge(s) this receipt belongs to")
+        for other in b.get("with_receipts") or []:
+            other = int(other)
+            matching.set_links(db, other, list(dict.fromkeys(matching.links_of(db, other) + ids)))
+        receipts.apply(db, rid, ids)
+        tid = ids[0]
     db.commit()
     return jsonify(transaction_id=tid, receipt=receipts.get(db, rid))
+
+
+@bp.post("/receipts/<int:rid>/unapply")
+def unapply_receipt(rid):
+    db = get_db()
+    receipts.unapply(db, rid)
+    db.commit()
+    return jsonify(receipt=receipts.get(db, rid))
+
+
+@bp.get("/receipts/<int:rid>/charges")
+def search_charges(rid):
+    return jsonify(matching.search(get_db(), request.args.get("q"), rid=rid))
 
 
 @bp.delete("/receipts/<int:rid>")

@@ -43,9 +43,17 @@ def parse(text):
     return None
 
 
+ORDER_COUPON = re.compile(r"BASKET|ORDER|TOTAL|TRANSACTION|PURCHASE OF|SPEND")
+
+
 def parse_meijer(text):
+    """Item discounts ("=> 50% off 6.99" right under the item) come off that item. Coupons on the
+    whole order - set apart by a blank line at the end ("Total Basket Coupon", "mPerks Offer
+    => 15.00 off"), labeled basket/order, or bigger than the item above them - become their own
+    "Coupon" line instead of being taken off the last item."""
     lines = [ln.rstrip() for ln in text.splitlines()]
     items, dept, pending, started = [], None, None, False
+    gap, label = False, ""   # blank line since the last item / text heading above a discount
     tax = total = None
     purchase_date = ""
     m = DATE.search(text)
@@ -58,12 +66,26 @@ def parse_meijer(text):
             pass
 
     def add(name, amount, flag):
+        nonlocal gap, label
         items.append({"name": _nice(name), "quantity": 1, "amount": round(amount, 2),
                       "taxable": "T" in flag, "category_id": 0, "department": dept})
+        gap, label = False, ""
+
+    def discount(amount, flag):
+        whole_order = (gap or ORDER_COUPON.search(label.upper()) or not items
+                       or items[-1].get("coupon") or items[-1]["amount"] + amount < -0.005)
+        if whole_order:
+            items.append({"name": "Coupon", "quantity": 1, "amount": round(amount, 2), "taxable": False,
+                          "category_id": 0, "department": None, "coupon": True,
+                          "detail": " ".join(x for x in (label, f"{-amount:.2f} off") if x)})
+        else:
+            items[-1]["amount"] = round(items[-1]["amount"] + amount, 2)
 
     for raw in lines:
         s = raw.strip()
         if not s:
+            if started and items:
+                gap = True
             continue
         up = s.upper()
         if up in DEPARTMENTS or (up.isalpha() and up in DEPARTMENTS):
@@ -87,9 +109,9 @@ def parse_meijer(text):
         pf = PRICE_END.search(raw)
         flag = (pf.group(2) or "") if pf else ""
         it = ITEM.match(s)
-        if s.startswith("=>"):  # discount or coupon on the previous item
-            if pf and items:
-                items[-1]["amount"] = round(items[-1]["amount"] + _money(pf.group(1)), 2)
+        if s.startswith("=>"):  # discount on the previous item, or a coupon on the whole order
+            if pf:
+                discount(_money(pf.group(1)), flag)
             continue
         if it and not re.match(r"^\d+(\.\d+)?\s*(LB\s*)?@", up):
             name = it.group(2)
@@ -117,6 +139,8 @@ def parse_meijer(text):
         if dept == "FUEL" and re.fullmatch(r"[A-Z ]{2,12}", up):
             pending = None  # grade name (UNL, PREM); the "G @" line carries the price
             continue
+        if not pf and not pending:
+            label = s.strip("* ")  # heading of the next discount, e.g. "Total Basket Coupon", "mPerks Offer"
 
     if total is None or not items:
         return None

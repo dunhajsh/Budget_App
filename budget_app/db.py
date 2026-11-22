@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS item_memory (
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Which card charges a receipt was applied to. Any shape: one receipt to one charge, several receipts
+-- paid in one charge (an Amazon order shipped in two boxes), or one receipt charged in several parts.
+-- (receipts.transaction_id is the charge suggested for a receipt / the first one it's applied to.)
+CREATE TABLE IF NOT EXISTS receipt_links (
+    receipt_id     INTEGER NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
+    transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    PRIMARY KEY (receipt_id, transaction_id)
+);
+CREATE INDEX IF NOT EXISTS ix_rlink_txn ON receipt_links(transaction_id);
+
 -- Every email looked at, so nothing is read twice.
 CREATE TABLE IF NOT EXISTS email_seen (
     account_id  INTEGER NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
@@ -226,6 +236,12 @@ def _migrate(conn):
         conn.row_factory = sqlite3.Row
         seed_from_reviewed(conn)
         conn.execute("INSERT INTO settings(key, value) VALUES ('item_memory_seeded', '1')")
+    if not conn.execute("SELECT 1 FROM settings WHERE key = 'receipt_links_seeded'").fetchone():
+        # receipts applied before links existed: one link each
+        conn.execute("""INSERT OR IGNORE INTO receipt_links(receipt_id, transaction_id)
+                        SELECT id, transaction_id FROM receipts WHERE status = 'applied' AND transaction_id IS NOT NULL
+                          AND transaction_id IN (SELECT id FROM transactions)""")
+        conn.execute("INSERT INTO settings(key, value) VALUES ('receipt_links_seeded', '1')")
     if "replaced_by" not in cols:
         # spreadsheet entries replaced by statement lines (import batch id); kept so an undo can restore them
         conn.execute("ALTER TABLE transactions ADD COLUMN replaced_by INTEGER")

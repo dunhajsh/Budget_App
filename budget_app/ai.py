@@ -278,7 +278,7 @@ RECEIPT_SYSTEM = """You read shopping receipts for a household budgeting app and
 Rules:
 - One entry per purchased line. Expand cryptic abbreviations into readable product names (e.g. "GV 2% MLK GAL" -> "Great Value 2% milk, gallon").
 - `amount` is the price paid for that line BEFORE sales tax, after any discount printed directly under that item. Fold item-level discounts into the item.
-- Order-level coupons, mPerks/rewards savings or discounts not tied to one item become their own line with a NEGATIVE amount.
+- Order-level coupons, mPerks/rewards savings or discounts not tied to one item (e.g. "Total Basket Coupon", "$15 off your purchase", usually printed after the last item) become their own line named "Coupon" with a NEGATIVE amount - never subtract them from the item above. A discount bigger than the item above it is an order-level coupon.
 - Bottle deposits, bag fees, delivery fees, service fees and tips are their own lines.
 - Do NOT include subtotal, tax, total, payment, change, or balance lines as items.
 - `taxable`: true if the receipt marks the line as taxed (often a T/X/TX flag) - when the receipt has no tax flags, mark food as false and non-food as true.

@@ -30,7 +30,8 @@ export default {
       <div class="panel">
         <div class="panel-head"><h2>Envelope detail</h2>
           <select id="cat-pick">${ordered.map((c) => `<option value="${c.id}" ${c.id === catId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select>
-          <span class="muted small">last ${span} months</span></div>
+          <span class="muted small">last ${span} months</span><span class="spacer"></span>
+          <a class="btn small" id="full-breakdown" href="#/spending?env=${catId}">Full breakdown →</a></div>
         <div class="grid grid-2">
           <div class="chart-box"><canvas id="ch-cat"></canvas></div>
           <div><div class="chart-box" style="height:200px"><canvas id="ch-sub"></canvas></div>
@@ -97,7 +98,10 @@ export default {
     };
     drawCat();
 
-    el.querySelector("#cat-pick").onchange = (e) => { catId = +e.target.value; drawCat(); };
+    el.querySelector("#cat-pick").onchange = (e) => {
+      catId = +e.target.value; drawCat();
+      el.querySelector("#full-breakdown").href = `#/spending?env=${catId}`;
+    };
     el.querySelectorAll("[data-span]").forEach((c) => (c.onclick = () => { span = +c.dataset.span; this.render(el, alive); }));
     el.querySelectorAll("[data-year]").forEach((b) => (b.onclick = () => { year += +b.dataset.year; this.render(el, alive); }));
   },

@@ -4,12 +4,13 @@ import transactions from "./views/transactions.js";
 import receipts from "./views/receipts.js";
 import budget from "./views/budget.js";
 import reports from "./views/reports.js";
+import spending from "./views/spending.js";
 import settings from "./views/settings.js";
 
-const views = { dashboard, transactions, receipts, budget, reports, settings };
+const views = { dashboard, transactions, receipts, budget, spending, reports, settings };
 const titles = {
   dashboard: "Dashboard", transactions: "Transactions", receipts: "Receipts",
-  budget: "Budget", reports: "Reports", settings: "Settings",
+  budget: "Budget", spending: "Spending breakdown", reports: "Reports", settings: "Settings",
 };
 
 export const state = {

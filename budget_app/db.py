@@ -206,6 +206,10 @@ def _migrate(conn):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(income)")}
     if "batch_id" not in cols:
         conn.execute("ALTER TABLE income ADD COLUMN batch_id INTEGER")
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(transactions)")}
+    if "replaced_by" not in cols:
+        # spreadsheet entries replaced by statement lines (import batch id); kept so an undo can restore them
+        conn.execute("ALTER TABLE transactions ADD COLUMN replaced_by INTEGER")
 
 
 def rows(cursor):

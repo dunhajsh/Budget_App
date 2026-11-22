@@ -11,7 +11,10 @@ const titleCase = (s) => (s || "").toLowerCase().replace(/\b([a-z])/g, (c) => c.
 const shortDate = (d) => new Date(d + "T12:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 
 function catCell(t) {
-  if (t.excluded) return `<span class="badge">Not budgeted (payment/transfer)</span>`;
+  if (t.excluded && /^Counted as income/.test(t.notes || "")) return `<span class="badge good" title="${esc(t.notes)}">Counted as income</span>`;
+  if (t.excluded) return /^Not in your spreadsheet/.test(t.notes || "")
+    ? `<span class="badge warn" title="${esc(t.notes)}">Not in spreadsheet · not budgeted</span>`
+    : `<span class="badge">Not budgeted (payment/transfer)</span>`;
   if (t.splits.length > 1) {
     return `<div class="small">${t.splits.map((s) => `<div>${esc(catName(s.category_id))} <span class="muted">${money(s.amount)}</span></div>`).join("")}</div>`;
   }
@@ -189,9 +192,10 @@ export function importDialog() {
         <input type="file" accept=".csv,text/csv" multiple hidden></div>
       <div id="files"></div>
       <p class="small muted" style="margin:0">Re-importing the same file is safe - duplicates are skipped.
-        <b>Card statements</b> count toward the statement's month. <b>Bank accounts</b>: bills count in the month they're paid, paychecks and interest go to
+        Every purchase counts in the month it was made. <b>Bank accounts</b>: bills count in the month they're paid, paychecks and interest go to
         income, transfers between your accounts and card payments are left out, other deposits (refunds, reimbursements) show up as credits to categorize.
-        Months your spreadsheet already covers aren't added again; they're used to put merchant names on that history and to learn your categories.</p>
+        In months your spreadsheet already covers, statement lines take the place of the matching spreadsheet entries (keeping their envelopes),
+        so those months still add up exactly to the spreadsheet; lines the spreadsheet doesn't have are shown but not budgeted.</p>
     </div>`,
     foot: `<button data-close>Cancel</button><button class="primary" data-go disabled>Import</button>`,
     onMount(root, close) {
@@ -200,21 +204,20 @@ export function importDialog() {
       const input = dz.querySelector("input");
       const list = root.querySelector("#files");
       const draw = () => {
-        list.innerHTML = files.length ? `<div class="table-wrap"><table><thead><tr><th>File</th><th>What's in it</th><th>Account</th><th>Budget month</th></tr></thead><tbody>
+        list.innerHTML = files.length ? `<div class="table-wrap"><table><thead><tr><th>File</th><th>What's in it</th><th>Account</th></tr></thead><tbody>
           ${files.map((f, i) => {
             const p = f.p;
-            if (!p) return `<tr><td>${esc(f.file.name)}</td><td colspan="3">${f.err ? `<span class="bad">${esc(f.err)}</span>` : `<span class="spinner"></span>`}</td></tr>`;
+            if (!p) return `<tr><td>${esc(f.file.name)}</td><td colspan="2">${f.err ? `<span class="bad">${esc(f.err)}</span>` : `<span class="spinner"></span>`}</td></tr>`;
             const bits = [`${p.count} rows, ${p.first} → ${p.last}`];
             if (p.kind === "bank") {
               if (p.income) bits.push(`${p.income} paycheck/interest`);
               if (p.credits) bits.push(`${p.credits} other deposits`);
               if (p.transfers + p.payments) bits.push(`${p.transfers + p.payments} transfers/card payments left out`);
             } else if (p.payments) bits.push(`${p.payments} card payment(s) left out`);
-            if (p.in_history) bits.push(`<span class="accent">${p.in_history} in months your spreadsheet covers (through ${monthLabel(p.history_through, true)}) - used to learn, not added</span>`);
+            if (p.in_history) bits.push(`<span class="accent">${p.in_history} in months your spreadsheet covers (through ${monthLabel(p.history_through, true)}) - these replace the matching spreadsheet entries; month totals stay the same</span>`);
             return `<tr><td><b>${esc(f.file.name)}</b><div class="small muted">${p.kind === "bank" ? "🏦 Bank account" : "💳 Card statement"}</div></td>
               <td class="small">${bits.join(" · ")}</td>
-              <td><input data-acct="${i}" value="${esc(f.account)}" list="acct" style="width:170px"></td>
-              <td>${p.kind === "bank" ? `<span class="small muted">Each row's own month</span>` : `<input type="month" data-month="${i}" value="${f.month}">`}</td></tr>`;
+              <td><input data-acct="${i}" value="${esc(f.account)}" list="acct" style="width:170px"></td></tr>`;
           }).join("")}</tbody></table></div>
           <datalist id="acct">${(state.status.accounts || []).filter((a) => a !== "Spreadsheet").map((a) => `<option value="${esc(a)}">`).join("")}</datalist>` : "";
         list.querySelectorAll("[data-acct]").forEach((x) => (x.oninput = () => { files[+x.dataset.acct].account = x.value; }));
@@ -252,7 +255,6 @@ export function importDialog() {
             const fd = new FormData();
             fd.append("file", f.file);
             fd.append("account", f.account || "");
-            if (f.p.kind === "card") fd.append("budget_month", f.month);
             results.push({ name: f.file.name, ...(await api("/import/statement", { method: "POST", form: fd })) });
           }
         } catch (e) { fail(e); }
@@ -284,6 +286,18 @@ function showResults(results) {
           <div class="sub">${Object.entries(incByMonth).sort().map(([m, a]) => `${monthLabel(m, true)}: ${money(a)}`).join(" · ") || "-"}</div></div>
         <div class="kpi"><div class="label">History matched</div><div class="value">${sum("history_matched")}</div><div class="sub">spreadsheet entries now have merchant names</div></div>
       </div>
+      ${(() => {
+        const h = {};
+        results.forEach((r) => Object.entries(r.history || {}).forEach(([k, n]) => (h[k] = (h[k] || 0) + n)));
+        const errs = results.filter((r) => r.history_error);
+        if (!Object.keys(h).length && !errs.length) return "";
+        return `<div><b>Months your spreadsheet covers</b> - statement lines now fill them in, and every envelope still matches the spreadsheet:
+          <div class="small muted" style="margin-top:4px">${[["exact", "matched an entry exactly"], ["split", "split across several entries"], ["combined", "combined into one entry"],
+            ["near", "matched an entry with a small typo (difference kept as its own line)"], ["pairs", "purchase + return that cancel out"],
+            ["not_in_sheet", "not in the spreadsheet - shown, but not budgeted"], ["left_out", "transfers/card payments"]]
+            .filter(([k]) => h[k]).map(([k, l]) => `${h[k]} ${l}`).join(" · ")}</div>
+          ${errs.map((r) => `<div class="small bad">${esc(r.name)}: ${esc(r.history_error)}</div>`).join("")}</div>`;
+      })()}
       ${rules.length ? `<div><b>Learned ${rules.length} merchant rules from your spreadsheet history</b>${sum("recategorized") ? ` (and re-sorted ${sum("recategorized")} unreviewed transactions)` : ""}:
         <div class="small muted" style="margin-top:4px;columns:2">${rules.map((r) => `${esc(r.pattern)} → ${esc(r.category)}`).join("<br>")}</div></div>` : ""}
       ${!sum("imported") && !income.length && results.every((r) => r.kind === "card") ? `<div class="alert info"><span class="ico">ℹ️</span><span>

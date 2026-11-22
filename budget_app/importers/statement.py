@@ -3,14 +3,13 @@
 Works with SoFi's exports out of the box and tries to auto-detect the columns of
 other banks (Chase, Capital One, Discover, Amex, Citi...).
 
-Card statements: every row counts toward one budget month (the statement month).
-Bank accounts: each row counts toward the month it happened in, and rows are sorted
-into spending, income (paychecks, interest; can count toward the next month's budget),
+Every row counts toward the month it happened in (like a spreadsheet budget). Bank rows
+are sorted into spending, income (paychecks, interest; can count toward the next month's budget),
 credits (refunds/reimbursements to categorize), transfers and card payments (left out).
 
-Months already covered by the imported spreadsheet are never added twice. Instead
-their rows are matched to the spreadsheet entries (same month, same amount) to give
-those entries real merchant names and dates, and to learn merchant -> envelope rules.
+Months already covered by the imported spreadsheet are never counted twice: their
+statement lines replace the matching spreadsheet entries without changing any total
+(see reconcile.py), and merchant -> envelope rules are learned from them.
 """
 import csv
 import hashlib
@@ -22,6 +21,7 @@ from datetime import datetime
 from ..budget import month_add
 from ..categorize import find_category, load_rules, merchant_key, upsert_rule
 from ..db import get_setting
+from .reconcile import ReconcileError, reconcile
 
 DATE_COLS = ["transaction date", "trans. date", "trans date", "date", "posted date", "post date"]
 POST_COLS = ["post date", "posted date", "posting date"]
@@ -199,12 +199,11 @@ def preview(db, text, filename):
     last_hist = max(hist) if hist else ""
     offset = income_offset(db)
     flows = Counter(t["flow"] for t in txns)
-    month = guess_budget_month(txns, filename)
-    in_hist = sum(1 for t in txns if (t["date"][:7] if kind == "bank" else month) <= last_hist and t["flow"] != "income")
+    in_hist = sum(1 for t in txns if t["date"][:7] <= last_hist and t["flow"] != "income")
     return {
         "kind": kind,
         "count": len(txns),
-        "budget_month": month,
+        "budget_month": guess_budget_month(txns, filename),
         "first": min((t["date"] for t in txns), default=None),
         "last": max((t["date"] for t in txns), default=None),
         "total_spent": round(sum(t["amount"] for t in txns if t["flow"] in ("spend", "credit")), 2),
@@ -219,31 +218,6 @@ def preview(db, text, filename):
 
 
 # ---------------------------------------------------------------- matching to spreadsheet history
-
-def _enrich_txn(db, month, t, account, rules, stmt_map):
-    """Give a spreadsheet entry with the same month and amount this row's merchant and date.
-    If entries with that amount sit in different envelopes (e.g. two $150 bills), use an existing
-    rule or the card's own category to pick one; with no clue, leave it alone rather than guess."""
-    cands = db.execute(
-        """SELECT t.id, s.category_id FROM transactions t LEFT JOIN splits s ON s.transaction_id = t.id
-           WHERE t.source = 'excel' AND t.budget_month = ? AND ABS(t.amount - ?) < 0.005
-               AND t.description LIKE '%(spreadsheet)' ORDER BY t.id""",
-        (month, t["amount"]),
-    ).fetchall()
-    if not cands:
-        return False
-    pick = cands[0]
-    if len({_envelope(db, c["category_id"]) for c in cands}) > 1:
-        hint, _ = find_category(db, t["description"], t["statement_category"], rules=rules, stmt_map=stmt_map)
-        hint_env = _envelope(db, hint) if hint else None
-        same = [c for c in cands if hint_env and _envelope(db, c["category_id"]) == hint_env]
-        if not same:
-            return False
-        pick = same[0]
-    db.execute("UPDATE transactions SET description = ?, merchant = ?, date = ?, account = ? WHERE id = ?",
-               (t["description"], merchant_key(t["description"]), t["date"], account, pick["id"]))
-    return True
-
 
 def _enrich_income(db, month, t):
     r = db.execute(
@@ -263,16 +237,17 @@ def _envelope(db, cid):
 
 
 def learn_rules(db, min_count=2, min_share=0.8):
-    """Create merchant rules from spreadsheet entries that have merchant names (see _enrich_txn).
-    Only merchants that went to the same envelope consistently. Existing rules are never changed.
+    """Create merchant rules from how you've categorized: statement lines that replaced spreadsheet
+    entries, and transactions you've reviewed. Only merchants that went to the same envelope
+    consistently; existing rules are never changed.
     Returns ([(pattern, category name)], [(pattern, existing category, history category)])."""
     counts = defaultdict(Counter)
     for r in db.execute(
         """SELECT t.merchant, s.category_id FROM transactions t JOIN splits s ON s.transaction_id = t.id
-           WHERE t.source = 'excel' AND t.merchant IS NOT NULL AND t.amount > 0
-               AND t.description NOT LIKE '%(spreadsheet)'"""
+           WHERE t.source = 'statement' AND t.reviewed = 1 AND t.excluded = 0 AND t.merchant IS NOT NULL AND t.amount > 0
+             AND (SELECT COUNT(*) FROM splits x WHERE x.transaction_id = t.id) = 1"""
     ):
-        counts[r["merchant"]][r["category_id"]] += 1
+        counts[r["merchant"]][_envelope(db, r["category_id"])] += 1
     rules = load_rules(db)
     learned, conflicts = [], []
     for key, c in counts.items():
@@ -283,7 +258,7 @@ def learn_rules(db, min_count=2, min_share=0.8):
             continue
         existing, how = find_category(db, key, rules=rules, stmt_map={})
         if existing:
-            if _envelope(db, existing) != _envelope(db, cid):
+            if _envelope(db, existing) != cid:
                 conflicts.append((key, existing, cid))
             continue
         upsert_rule(db, key, cid)
@@ -316,21 +291,20 @@ def recategorize_unreviewed(db):
 # ---------------------------------------------------------------- import
 
 def import_statement(db, text, filename, account=None, budget_month=None):
+    """Import a card or bank CSV. Every row counts toward the month of its own date (the way a
+    spreadsheet budget is kept); `budget_month` is accepted for older callers and ignored."""
     txns = parse_csv(text)
-    empty = {"imported": 0, "duplicates": 0, "auto_categorized": 0, "budget_month": budget_month}
     if not txns:
-        return empty
+        return {"imported": 0, "duplicates": 0, "auto_categorized": 0, "budget_month": None}
     is_bank = txns[0]["kind"] == "bank"
-    account = account or guess_account(filename, txns[0]["kind"])
-    if not is_bank:
-        budget_month = budget_month or guess_budget_month(txns, filename)
+    account = account or guess_account(filename, txns[0]["kind"], get_setting(db, "default_account"))
     hist = history_months(db)
     last_hist = max(hist) if hist else ""
     offset = income_offset(db)
 
     cur = db.execute(
         "INSERT INTO import_batches(kind, filename, budget_month, row_count) VALUES (?, ?, ?, ?)",
-        ("bank" if is_bank else "statement", filename, None if is_bank else budget_month, len(txns)),
+        ("bank" if is_bank else "statement", filename, None if is_bank else guess_budget_month(txns, filename), len(txns)),
     )
     batch_id = cur.lastrowid
     rules = load_rules(db)
@@ -340,8 +314,9 @@ def import_statement(db, text, filename, account=None, budget_month=None):
     res = Counter()
     months = Counter()
     income_added = []
+    history_lines = []
     for t in txns:
-        month = t["date"][:7] if is_bank else budget_month
+        month = t["date"][:7]
         key = f"{account}|{t['date']}|{t['description']}|{t['amount']:.2f}"
         seen[key] += 1
         h = hashlib.sha1(f"{key}|{seen[key]}".encode()).hexdigest()
@@ -364,19 +339,18 @@ def import_statement(db, text, filename, account=None, budget_month=None):
                 income_added.append({"month": inc_month, "date": t["date"], "amount": t["amount"], "description": t["description"]})
             continue
 
-        if month <= last_hist:
-            if not t["excluded"] and _enrich_txn(db, month, t, account, rules, stmt_map):
-                res["history_matched"] += 1
-            elif db.execute("SELECT 1 FROM transactions WHERE source = 'excel' AND budget_month = ? "
-                            "AND description = ? AND ABS(amount - ?) < 0.005", (month, t["description"], t["amount"])).fetchone():
-                res["duplicates"] += 1   # matched on an earlier import
-            else:
-                res["history_skipped"] += 1
-            continue
-
-        if db.execute("SELECT 1 FROM transactions WHERE import_hash = ?", (h,)).fetchone():
+        # Already imported? Same fingerprint, or (if the account was named differently) as many rows with
+        # this date, description and amount as this file has so far.
+        same = db.execute("SELECT COUNT(*) FROM transactions WHERE source = 'statement' AND date = ? AND description = ? "
+                          "AND ABS(amount - ?) < 0.005", (t["date"], t["description"], t["amount"])).fetchone()[0]
+        if same >= seen[key] or db.execute("SELECT 1 FROM transactions WHERE import_hash = ?", (h,)).fetchone():
             res["duplicates"] += 1
             continue
+
+        if month <= last_hist:
+            history_lines.append(dict(t, month=month, hash=h))
+            continue
+
         cur = db.execute(
             """INSERT INTO transactions(date, post_date, description, merchant, amount, account, source,
                    budget_month, statement_category, txn_type, excluded, reviewed, import_hash, batch_id)
@@ -400,13 +374,25 @@ def import_statement(db, text, filename, account=None, budget_month=None):
                 db.execute("UPDATE rules SET hits = hits + 1 WHERE id = ?", (int(how[5:]),))
             res["auto_categorized"] += 1
 
+    history = {}
+    error = None
+    if history_lines:
+        try:
+            history = reconcile(db, history_lines, account, batch_id, rules, stmt_map)
+        except ReconcileError as e:
+            error = f"Couldn't fit this file's spreadsheet months without changing their totals, so they were skipped ({e})."
+            res["history_skipped"] += len(history_lines)
+    matched = sum(history.get(k, 0) for k in ("exact", "near", "split", "combined"))
+    res["history_matched"] += matched
+
     learned, conflicts = ([], [])
     recat = 0
-    if res["history_matched"]:
+    if matched:
         learned, conflicts = learn_rules(db)
         if learned:
             recat = recategorize_unreviewed(db)
-    db.execute("UPDATE import_batches SET row_count = ? WHERE id = ?", (res["imported"] + len(income_added), batch_id))
+    db.execute("UPDATE import_batches SET row_count = ? WHERE id = ?",
+               (res["imported"] + len(income_added) + sum(history.values()), batch_id))
     return {
         "batch_id": batch_id,
         "kind": "bank" if is_bank else "card",
@@ -414,13 +400,15 @@ def import_statement(db, text, filename, account=None, budget_month=None):
         "imported": res["imported"],
         "duplicates": res["duplicates"],
         "auto_categorized": res["auto_categorized"],
-        "left_out": res["left_out"],
+        "left_out": res["left_out"] + history.get("left_out", 0),
         "history_matched": res["history_matched"],
         "history_skipped": res["history_skipped"],
+        "history": history,
+        "history_error": error,
         "income_added": income_added,
         "rules_learned": [{"pattern": p, "category": c} for p, c in learned],
         "recategorized": recat,
-        "budget_month": (months.most_common(1)[0][0] if months else None) if is_bank else budget_month,
+        "budget_month": months.most_common(1)[0][0] if months else (history_lines[0]["month"] if history_lines else None),
         "months": dict(months),
         "statement_categories": sorted({t["statement_category"] for t in txns
                                         if t["statement_category"] and not t["excluded"]}),

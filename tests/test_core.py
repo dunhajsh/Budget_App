@@ -131,7 +131,9 @@ class StatementTests(unittest.TestCase):
         s = month_summary(self.db, "2026-10")
         spent = {e["name"]: e["spent"] for e in s["envelopes"]}
         self.assertAlmostEqual(spent["Food"], 71.04)
-        self.assertAlmostEqual(spent["Eating Out"], 5.25)  # Sep 30 charge counts toward the October statement
+        self.assertAlmostEqual(spent["Eating Out"], 0)  # the Sep 30 charge counts in September, when it happened
+        sep = {e["name"]: e["spent"] for e in month_summary(self.db, "2026-09")["envelopes"]}
+        self.assertAlmostEqual(sep["Eating Out"], 5.25)
         self.assertEqual(s["uncategorized_count"], 2)
 
 
@@ -286,9 +288,16 @@ class BankAccountTests(unittest.TestCase):
         mort = self.db.execute("SELECT * FROM transactions WHERE source = 'statement' AND description = 'MORTGAGE CO'").fetchone()
         self.assertEqual(mort["budget_month"], "2026-03")
         self.assertEqual(self.db.execute("SELECT category_id FROM splits WHERE transaction_id = ?", (mort["id"],)).fetchone()[0], 1)
-        # History entries got real names and dates; amounts unchanged.
+        # The statement line replaced the spreadsheet entry (kept, excluded, for undo); same envelope and total.
         h = self.db.execute("SELECT * FROM transactions WHERE source = 'excel' AND budget_month = '2026-01'").fetchone()
-        self.assertEqual((h["description"], h["date"], h["amount"]), ("MORTGAGE CO", "2026-01-10", 1500.0))
+        self.assertEqual((h["excluded"], h["replaced_by"]), (1, res["batch_id"]))
+        jan = self.db.execute("""SELECT t.*, s.category_id FROM transactions t JOIN splits s ON s.transaction_id = t.id
+                                 WHERE t.source = 'statement' AND t.budget_month = '2026-01' AND t.excluded = 0""").fetchone()
+        self.assertEqual((jan["description"], jan["date"], jan["amount"], jan["category_id"]), ("MORTGAGE CO", "2026-01-10", 1500.0, 1))
+        self.assertAlmostEqual(month_summary(self.db, "2026-02")["spent"], 1500 + 58 + 12)   # unchanged
+        # Lines that aren't in the spreadsheet are recorded but not budgeted.
+        friend = self.db.execute("SELECT * FROM transactions WHERE description = 'FRIEND REIMBURSED'").fetchone()
+        self.assertEqual((friend["excluded"], friend["budget_month"]), (1, "2026-02"))
         # Income: Feb paycheck (in Feb history) -> skipped/matched; Feb interest -> March income; March paycheck -> April.
         inc = {(r["month"], r["amount"]) for r in self.db.execute("SELECT * FROM income WHERE source = 'statement'")}
         self.assertEqual(inc, {("2026-03", 2500.0), ("2026-03", 4.1), ("2026-04", 2500.0)})
@@ -310,12 +319,14 @@ class BankAccountTests(unittest.TestCase):
                     "2026-02-05,GIVING CO,DIRECT_PAY,-150.00,100,Posted\n2026-02-15,LOAN SERVICER,DIRECT_PAY,-150.00,100,Posted\n")
         res = statement.import_statement(db, csv_text, "checking.csv")
         self.assertEqual(res["history_matched"], 0)          # no clue which is which -> left alone
+        db.execute("DELETE FROM transactions WHERE batch_id = ?", (res["batch_id"],))
         from budget_app.categorize import upsert_rule
-        upsert_rule(db, "LOAN SERVICER", 5)                     # with a clue, the right one is picked
-        statement.import_statement(db, csv_text.replace("100,Posted", "101,Posted"), "checking2.csv")
-        r = db.execute("""SELECT s.category_id FROM transactions t JOIN splits s ON s.transaction_id = t.id
-                          WHERE t.source = 'excel' AND t.description = 'LOAN SERVICER'""").fetchone()
-        self.assertEqual(r[0], 5)
+        upsert_rule(db, "LOAN SERVICER", 5)                     # with a clue, the right one is picked...
+        res = statement.import_statement(db, csv_text, "checking.csv")
+        self.assertEqual(res["history_matched"], 2)          # ...and that settles the other one too
+        cats = dict(db.execute("""SELECT t.description, s.category_id FROM transactions t JOIN splits s ON s.transaction_id = t.id
+                                  WHERE t.source = 'statement'""").fetchall())
+        self.assertEqual(cats, {"LOAN SERVICER": 5, "GIVING CO": 4})
 
     def test_undo_removes_income(self):
         tmp = tempfile.mkdtemp()
@@ -335,6 +346,66 @@ class BankAccountTests(unittest.TestCase):
             db.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ReconcileTests(unittest.TestCase):
+    """Statement lines replacing spreadsheet history: every case, totals unchanged, undo restores."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.app = create_app(data_dir=self.tmp, testing=True)
+        self.db = connect(os.path.join(self.tmp, "budget.db"))
+        db = self.db
+        db.execute("INSERT INTO categories(id, name) VALUES (1, 'Clothes'), (2, 'Groceries'), (3, 'House'), (4, 'Misc')")
+        db.execute("INSERT INTO rules(pattern, category_id) VALUES ('MORTGAGE CO', 3)")
+        sheet = [("2026-05", 141.08, 1), ("2026-05", 6.50, 2),     # one store charge split over two envelopes
+                 ("2026-05", 303.00, 2),                           # a May 31 purchase on the June statement
+                 ("2026-05", 1500.17, 3),                          # mortgage typed with a typo
+                 ("2026-05", 30.00, 4),                            # two coffee charges entered as one
+                 ("2026-05", 40.00, 4)]                            # cash - no statement line
+        for m, a, c in sheet:
+            cur = db.execute("INSERT INTO transactions(date, description, amount, source, budget_month, reviewed) "
+                             "VALUES (?, 'x (spreadsheet)', ?, 'excel', ?, 1)", (m + "-01", a, m))
+            db.execute("INSERT INTO splits(transaction_id, category_id, amount) VALUES (?, ?, ?)", (cur.lastrowid, c, a))
+        db.commit()
+        self.csv = """Transaction Date,Post Date,Description,Category,Type,Amount
+2026-05-31,2026-05-31,BIG GROCER #12,Groceries,Sale,303.00
+2026-05-20,2026-05-20,CLOTHING BARN #9,Shopping,Sale,147.58
+2026-05-18,2026-05-18,MORTGAGE CO,Home,Sale,1500.79
+2026-05-12,2026-05-12,BEAN CAFE,Dining,Sale,12.00
+2026-05-10,2026-05-10,BEAN CAFE,Dining,Sale,18.00
+2026-05-08,2026-05-08,SHOE PLACE #3,Shopping,Sale,84.10
+2026-05-09,2026-05-09,SHOE PLACE #3 TOWN,Shopping,Return,-84.10
+2026-05-05,2026-05-05,SURPRISE SHOP,Shopping,Sale,9.99
+"""
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_reconcile_keeps_totals_and_undo_restores(self):
+        before = {e["name"]: e["spent"] for e in month_summary(self.db, "2026-05")["envelopes"]}
+        res = statement.import_statement(self.db, self.csv, "card.csv", "Card")
+        self.db.commit()
+        h = res["history"]
+        self.assertEqual((h["exact"], h["near"], h["split"], h["combined"], h["pairs"], h["not_in_sheet"]), (1, 1, 1, 2, 2, 1))
+        after = {e["name"]: e["spent"] for e in month_summary(self.db, "2026-05")["envelopes"]}
+        self.assertEqual(before, after)                                     # every envelope still matches
+        q = lambda d: self.db.execute("""SELECT t.budget_month, t.excluded, GROUP_CONCAT(s.category_id || ':' || s.amount)
+                                         FROM transactions t LEFT JOIN splits s ON s.transaction_id = t.id
+                                         WHERE t.source = 'statement' AND t.description = ? GROUP BY t.id""", (d,)).fetchone()
+        self.assertEqual(q("BIG GROCER #12")[0], "2026-05")
+        self.assertEqual(sorted(q("CLOTHING BARN #9")[2].split(",")), ["1:141.08", "2:6.5"])
+        self.assertEqual(q("SURPRISE SHOP")[1], 1)                         # not in the sheet -> not budgeted
+        diff = self.db.execute("SELECT amount FROM transactions WHERE description = 'Spreadsheet difference'").fetchone()[0]
+        self.assertAlmostEqual(diff, -0.62)
+        # Cash entry is still there as spreadsheet-only; replaced ones are hidden from the list.
+        with self.app.test_client() as c:
+            rows = c.get("/api/transactions?month=2026-05").get_json()
+            self.assertEqual(sum(1 for r in rows if r["source"] == "excel" and r["description"] == "x (spreadsheet)"), 1)
+            c.delete(f"/api/import/batches/{res['batch_id']}")
+        self.assertEqual({e["name"]: e["spent"] for e in month_summary(self.db, "2026-05")["envelopes"]}, before)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM transactions WHERE source = 'excel' AND excluded = 0").fetchone()[0], 6)
 
 
 class LocalModelTests(unittest.TestCase):
@@ -557,7 +628,7 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(r.get_json()["imported"], 7)
         self.assertEqual(self.c.get("/").status_code, 200)
         s = self.c.get("/api/summary?month=2026-10").get_json()
-        self.assertEqual(s["uncategorized_count"], 6)
+        self.assertEqual(s["uncategorized_count"], 5)   # the Sep 30 coffee counts in September
         txns = self.c.get("/api/transactions?month=2026-10&filter=uncategorized").get_json()
         meijer = next(t for t in txns if "MEIJER" in t["description"])
         food = next(c for c in self.c.get("/api/categories").get_json() if c["name"] == "Food")

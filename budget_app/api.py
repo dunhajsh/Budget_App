@@ -242,7 +242,7 @@ def _txn_rows(db, where, args, limit=2000):
 @bp.get("/transactions")
 def list_transactions():
     db = get_db()
-    where, args = ["1=1"], []
+    where, args = ["t.replaced_by IS NULL"], []
     month = request.args.get("month")
     if month:
         where.append("t.budget_month = ?")
@@ -455,6 +455,7 @@ def undo_batch(bid):
     db = get_db()
     db.execute("UPDATE receipts SET transaction_id = NULL, status = 'parsed' WHERE transaction_id IN "
                "(SELECT id FROM transactions WHERE batch_id = ?)", (bid,))
+    db.execute("UPDATE transactions SET excluded = 0, replaced_by = NULL WHERE replaced_by = ?", (bid,))
     n = db.execute("DELETE FROM transactions WHERE batch_id = ?", (bid,)).rowcount
     n += db.execute("DELETE FROM income WHERE batch_id = ?", (bid,)).rowcount
     db.execute("DELETE FROM import_batches WHERE id = ?", (bid,))
@@ -564,7 +565,10 @@ def transaction_to_income(tid):
     month = _month(_body().get("month") or month_add(t["budget_month"], statement.income_offset(db)))
     db.execute("INSERT INTO income(month, date, amount, description, source, batch_id) VALUES (?, ?, ?, ?, 'statement', ?)",
                (month, t["date"], -t["amount"], t["description"], t["batch_id"]))
-    db.execute("DELETE FROM transactions WHERE id = ?", (tid,))
+    # Keep the row (not budgeted) so re-importing the same statement doesn't bring the deposit back.
+    db.execute("DELETE FROM splits WHERE transaction_id = ?", (tid,))
+    db.execute("UPDATE transactions SET excluded = 1, reviewed = 1, notes = ? WHERE id = ?",
+               (f"Counted as income ({month}).", tid))
     db.commit()
     return jsonify(ok=True, month=month)
 

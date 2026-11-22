@@ -30,4 +30,14 @@ def create_app(data_dir=None, testing=False):
     def index():
         return render_template("index.html")
 
+    @app.errorhandler(404)
+    def not_found(e):
+        # An /api address the server doesn't know usually means the page is newer than the
+        # running server (code was updated but the app wasn't restarted).
+        from flask import jsonify, request
+        if request.path.startswith("/api/"):
+            return jsonify(error="This feature isn't available in the running app. Restart it: close the Budget "
+                                 "window and run Start Budget.bat again."), 404
+        return e
+
     return app

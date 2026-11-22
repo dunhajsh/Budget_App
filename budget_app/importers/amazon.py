@@ -14,7 +14,7 @@ import zipfile
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
 
-from .. import ai, receipts
+from .. import ai, itemmemory, receipts
 
 
 def _find(headers, *options):
@@ -131,7 +131,9 @@ def import_orders(db, filename, data, since=None, use_ai=True):
             (ext, f"Order {s['order_id']}", s["date"].isoformat(), s["total"], s["total"]),
         )
         rid = cur.lastrowid
-        receipts.save_items(db, rid, [dict(i, taxable=False) for i in s["items"]])
+        its = [dict(i, taxable=False) for i in s["items"]]
+        itemmemory.apply(db, its)   # products you've filed before go where you put them
+        receipts.save_items(db, rid, its)
         rids.append(rid)
         created += 1
 
@@ -140,12 +142,13 @@ def import_orders(db, filename, data, since=None, use_ai=True):
     ai_error = None
     if rids and use_ai and ai.enabled(db):
         items = db.execute(
-            f"SELECT id, name, amount FROM receipt_items WHERE receipt_id IN ({','.join('?' * len(rids))})", rids
+            f"SELECT id, name, amount FROM receipt_items WHERE receipt_id IN ({','.join('?' * len(rids))}) "
+            "AND category_id IS NULL", rids
         ).fetchall()
         try:
             res = ai.categorize(db, [f"{i['name']} (${i['amount']:.2f})" for i in items], kind="Amazon order items")
             for idx, cid in res.items():
-                db.execute("UPDATE receipt_items SET category_id = ? WHERE id = ?", (cid, items[idx]["id"]))
+                db.execute("UPDATE receipt_items SET category_id = ?, cat_source = 'ai' WHERE id = ?", (cid, items[idx]["id"]))
                 categorized += 1
         except ai.AIError as e:
             ai_error = str(e)

@@ -9,7 +9,7 @@ from datetime import date, datetime
 from flask import Blueprint, abort, current_app, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
-from . import ai, emailscan, receipts
+from . import ai, emailscan, itemmemory, receipts
 from .budget import categories_tree, history, month_add, month_summary
 from .categorize import (apply_rules_to_uncategorized, find_category, merchant_key, set_single_category,
                          upsert_rule)
@@ -828,8 +828,14 @@ def update_receipt(rid):
     for field in ("merchant", "purchase_date", "subtotal", "tax", "total"):
         if field in b:
             db.execute(f"UPDATE receipts SET {field} = ? WHERE id = ?", (b[field], rid))
+    learned = updated = 0
     if "items" in b:
-        receipts.save_items(db, rid, b["items"])
+        items = [dict(i, cat_source=None) for i in b["items"]]   # saved by you: your choices now
+        receipts.save_items(db, rid, items)
+        # Remember where you filed each item, and re-file the same items on receipts not reviewed yet.
+        merchant = b.get("merchant") or (db.execute("SELECT merchant FROM receipts WHERE id = ?", (rid,)).fetchone() or {"merchant": None})["merchant"]
+        keys = itemmemory.learn(db, items, merchant)
+        learned, updated = len(keys), itemmemory.update_open_receipts(db, keys, exclude_receipt=rid)
     if "transaction_id" in b:
         db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (b["transaction_id"] or None, rid))
     if b.get("reviewed"):
@@ -839,7 +845,9 @@ def update_receipt(rid):
         db.execute("UPDATE receipts SET status = CASE WHEN status IN ('pending','error') THEN 'parsed' ELSE status END "
                    "WHERE id = ?", (rid,))
     db.commit()
-    return jsonify(receipts.get(db, rid))
+    out = receipts.get(db, rid)
+    out["memory"] = {"learned": learned, "updated_other_receipts": updated}
+    return jsonify(out)
 
 
 @bp.post("/receipts/<int:rid>/parse")
@@ -1089,5 +1097,36 @@ def email_seen_retry():
     b = _body()
     db.execute("UPDATE email_seen SET status = 'retry' WHERE account_id = ? AND message_id = ?",
                (b.get("account_id"), b.get("message_id")))
+    db.commit()
+    return jsonify(ok=True)
+
+
+# ------------------------------------------------------------------ item memory
+
+@bp.get("/item-memory")
+def list_item_memory():
+    db = get_db()
+    return jsonify(rows(db.execute(
+        """SELECT m.key, m.name, m.category_id, m.merchant, m.times, m.updated_at FROM item_memory m
+           ORDER BY m.updated_at DESC, m.name""")))
+
+
+@bp.patch("/item-memory")
+def update_item_memory():
+    db = get_db()
+    b = _body()
+    k, cid = b.get("key"), b.get("category_id")
+    if not k or not cid or not db.execute("SELECT 1 FROM categories WHERE id = ?", (cid,)).fetchone():
+        raise ValueError("key and a valid category_id are required")
+    db.execute("UPDATE item_memory SET category_id = ?, updated_at = datetime('now') WHERE key = ?", (cid, k))
+    n = itemmemory.update_open_receipts(db, [k])
+    db.commit()
+    return jsonify(ok=True, updated_other_receipts=n)
+
+
+@bp.delete("/item-memory")
+def delete_item_memory():
+    db = get_db()
+    db.execute("DELETE FROM item_memory WHERE key = ?", (_body().get("key") or request.args.get("key"),))
     db.commit()
     return jsonify(ok=True)

@@ -24,6 +24,10 @@ function card(r) {
   </div>`;
 }
 
+// Where an item's category came from (cleared when you change it yourself).
+const srcMark = (it) => it.cat_source === "memory" ? `<span title="Filed the way you filed it on an earlier receipt">🧠</span>`
+  : it.cat_source === "ai" ? `<span class="muted" title="AI guess - check it; when you save, your choice is remembered for next time">✨</span>` : "";
+
 export async function openReceipt(id) {
   let r;
   try { r = await api(`/receipts/${id}`); } catch (e) { return fail(e); }
@@ -65,7 +69,7 @@ export async function openReceipt(id) {
           <div class="row" style="margin-bottom:6px"><h3>Items</h3><span class="spacer"></span>
             <select class="cat" id="all-cat" style="max-width:220px">${catOptions(null, { empty: "Set all items to…" })}</select></div>
           <div class="table-wrap" style="max-height:330px;overflow:auto"><table class="items-table">
-            <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Price</th><th title="Taxed">Tax</th><th>Category</th><th></th></tr></thead>
+            <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Price</th><th title="Taxed">Tax</th><th>Category <span class="muted small" title="🧠 = filed the way you did before · ✨ = AI guess. Saving remembers your choices for future receipts.">ⓘ</span></th><th></th></tr></thead>
             <tbody id="items"></tbody></table></div>
           <div class="row" style="margin-top:8px"><button class="small" data-additem>＋ Add item</button><span class="spacer"></span><span id="check" class="small"></span></div>
         </div>
@@ -90,7 +94,8 @@ export async function openReceipt(id) {
           <td><input class="qty" data-i="${i}" data-f="quantity" value="${it.quantity ?? ""}"></td>
           <td><input class="money" data-i="${i}" data-f="amount" value="${it.amount}" style="width:80px"></td>
           <td><input type="checkbox" data-i="${i}" data-f="taxable" ${it.taxable ? "checked" : ""}></td>
-          <td><select class="cat ${it.category_id ? "" : "uncat"}" data-i="${i}" data-f="category_id">${catOptions(it.category_id)}</select></td>
+          <td><div class="row" style="gap:4px;flex-wrap:nowrap"><select class="cat ${it.category_id ? "" : "uncat"}" data-i="${i}" data-f="category_id">${catOptions(it.category_id)}</select>
+            <span class="src" data-src="${i}">${srcMark(it)}</span></div></td>
           <td><button class="ghost small" data-delitem="${i}">✕</button></td></tr>`).join("") ||
           `<tr><td colspan="6" class="muted small">No items yet - add them, or click Re-read.</td></tr>`;
         check();
@@ -113,10 +118,15 @@ export async function openReceipt(id) {
         if (i !== undefined) {
           const f = e.target.dataset.f;
           items[i][f] = f === "taxable" ? e.target.checked : f === "category_id" ? (e.target.value ? +e.target.value : null) : e.target.value;
-          if (f === "category_id") e.target.classList.toggle("uncat", !e.target.value);
+          if (f === "category_id") {
+            e.target.classList.toggle("uncat", !e.target.value);
+            items[i].cat_source = null;   // your choice now - it'll be remembered when you save
+            const m = root.querySelector(`[data-src="${i}"]`);
+            if (m) m.innerHTML = "";
+          }
         }
         if (e.target.id === "all-cat" && e.target.value) {
-          items.forEach((it) => (it.category_id = +e.target.value));
+          items.forEach((it) => { it.category_id = +e.target.value; it.cat_source = null; });
           e.target.value = "";
           drawItems();
           return;
@@ -144,7 +154,14 @@ export async function openReceipt(id) {
         return api(`/receipts/${r.id}`, { method: "PATCH", body });
       };
       root.querySelector("[data-save]").onclick = async () => {
-        try { await save(true); close(); toast("Receipt saved and marked as reviewed"); render(); } catch (e) { fail(e); }
+        try {
+          const res = await save(true);
+          const m = res.memory || {};
+          close();
+          toast(`Receipt saved and marked as reviewed${m.learned ? ` · learned ${m.learned} item${m.learned > 1 ? "s" : ""}` : ""}` +
+            `${m.updated_other_receipts ? ` · re-filed ${m.updated_other_receipts} matching item${m.updated_other_receipts > 1 ? "s" : ""} on other receipts` : ""}`);
+          render();
+        } catch (e) { fail(e); }
       };
       root.querySelector("[data-apply]").onclick = async () => {
         if (!chosen) return toast("Pick the card charge this receipt belongs to (or record it as cash/debit)", { error: true });

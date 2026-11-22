@@ -503,6 +503,61 @@ class ReceiptReadingTests(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class ItemMemoryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.app = create_app(data_dir=self.tmp, testing=True)
+        self.db = connect(os.path.join(self.tmp, "budget.db"))
+        self.db.execute("INSERT INTO categories(id, name) VALUES (1, 'Groceries'), (2, 'Baby'), (3, 'House')")
+        self.db.commit()
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def receipt(self, status, items):
+        cur = self.db.execute("INSERT INTO receipts(source, merchant, purchase_date, total, status) VALUES ('upload', 'Shop', '2026-10-01', 9, ?)", (status,))
+        from budget_app import receipts
+        receipts.save_items(self.db, cur.lastrowid, items)
+        self.db.commit()
+        return cur.lastrowid
+
+    def test_names_normalize(self):
+        from budget_app.itemmemory import key
+        self.assertEqual(key("BANANAS 2.3 LB"), key("Bananas"))
+        self.assertEqual(key("WaterWipes Sensitive+ Newborn & Baby Wipes, 3-In-1 Cleansing, 720 Count (12 packs)"),
+                         key("WaterWipes Sensitive+ Newborn & Baby Wipes, 3-In-1 Cleansing, 540 Count"))
+        self.assertNotEqual(key("Milk"), key("Oat Milk"))
+
+    def test_learns_from_saves_and_files_future_and_open_receipts(self):
+        from budget_app import itemmemory, receipts
+        open_rid = self.receipt("parsed", [{"name": "WIPES 72CT", "amount": 4, "category_id": 3, "cat_source": "ai"}])
+        rid = self.receipt("parsed", [{"name": "Wipes", "amount": 4, "category_id": 3, "cat_source": "ai"},
+                                      {"name": "BANANAS 2.3 LB", "amount": 1, "category_id": None}])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM item_memory").fetchone()[0], 0)   # AI guesses aren't learned
+        with self.app.test_client() as c:
+            r = c.patch(f"/api/receipts/{rid}", json={"reviewed": True, "items": [
+                {"name": "Wipes", "amount": 4, "category_id": 2, "cat_source": "ai"},       # you corrected the AI
+                {"name": "BANANAS 2.3 LB", "amount": 1, "category_id": 1}]}).get_json()
+        self.assertEqual(r["memory"], {"learned": 2, "updated_other_receipts": 1})
+        self.assertEqual([i["cat_source"] for i in r["items"]], [None, None])
+        # the open receipt's wipes were re-filed under your choice
+        self.assertEqual(self.db.execute("SELECT category_id, cat_source FROM receipt_items WHERE receipt_id = ?", (open_rid,)).fetchone()[:], (2, "memory"))
+        # a new receipt: your memory beats the AI's guess; unknown items keep the AI's guess
+        new = [{"name": "Bananas", "amount": 1.2, "category_id": 3}, {"name": "WIPES", "amount": 4, "category_id": 3},
+               {"name": "Bread", "amount": 3, "category_id": 1}]
+        self.assertEqual(itemmemory.apply(self.db, new), 2)
+        self.assertEqual([(i["category_id"], i["cat_source"]) for i in new], [(1, "memory"), (2, "memory"), (1, "ai")])
+
+    def test_text_receipts_use_memory_before_ai(self):
+        from budget_app import receipts
+        from budget_app.itemmemory import learn
+        learn(self.db, [{"name": "Gr Beef", "category_id": 1}, {"name": "Bandages", "category_id": 3}])
+        items = [{"name": "GR BEEF", "amount": 5}, {"name": "Bandages", "amount": 2}]
+        self.assertIsNone(receipts.categorize_items(self.db, items, "Meijer"))   # AI off: nothing else to do
+        self.assertEqual([i["category_id"] for i in items], [1, 3])
+
+
 class LocalModelTests(unittest.TestCase):
     """The Ollama path, with the HTTP call replaced by a fake."""
 
@@ -710,7 +765,10 @@ class ApiSmokeTests(unittest.TestCase):
         self.c = self.app.test_client()
 
     def tearDown(self):
-        shutil.rmtree(self.tmp)
+        from budget_app.receipts import WORKER
+        if WORKER.thread:
+            WORKER.thread.join(timeout=10)   # the background receipt reader may still have the test database open
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_end_to_end(self):
         path = os.path.join(self.tmp, "b.xlsx")

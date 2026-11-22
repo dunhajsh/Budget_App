@@ -4,7 +4,7 @@ import re
 from collections import defaultdict
 from datetime import date
 
-from . import ai
+from . import ai, itemmemory
 
 
 def _d(s):
@@ -42,10 +42,10 @@ def save_items(db, rid, items):
         if cid and not db.execute("SELECT 1 FROM categories WHERE id = ?", (cid,)).fetchone():
             cid = None
         db.execute(
-            "INSERT INTO receipt_items(receipt_id, name, quantity, amount, taxable, category_id, sort_order) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO receipt_items(receipt_id, name, quantity, amount, taxable, category_id, sort_order, cat_source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (rid, (it.get("name") or "Item").strip(), it.get("quantity"), round(float(it.get("amount") or 0), 2),
-             1 if it.get("taxable", True) else 0, cid, i),
+             1 if it.get("taxable", True) else 0, cid, i, it.get("cat_source") if cid else None),
         )
 
 
@@ -64,6 +64,7 @@ def save_parsed(db, rid, res, text=None, email=None):
     if email:
         raw["email"] = email
     purchase_date = res.get("purchase_date") or ((email or {}).get("date") or "")[:10] or None
+    itemmemory.apply(db, res["items"])   # items you've filed before go where you put them
     db.execute(
         """UPDATE receipts SET merchant = ?, purchase_date = ?, subtotal = ?, tax = ?, total = ?,
                status = 'parsed', error = NULL, raw_json = ? WHERE id = ?""",
@@ -72,25 +73,10 @@ def save_parsed(db, rid, res, text=None, email=None):
     save_items(db, rid, res["items"])
 
 
-def remembered_categories(db, names):
-    """Categories already given to items with these names on earlier receipts (yours or the AI's)."""
-    out = {}
-    for n in set(names):
-        r = db.execute(
-            """SELECT category_id FROM receipt_items i JOIN categories c ON c.id = i.category_id
-               WHERE LOWER(i.name) = LOWER(?) AND c.archived = 0 ORDER BY i.id DESC LIMIT 1""", (n,)).fetchone()
-        if r:
-            out[n] = r["category_id"]
-    return out
-
-
 def categorize_items(db, items, store=""):
-    """Fill in category_id for items read without AI: remembered names first, then one AI call for the rest.
-    Returns an error message if the AI couldn't be reached (items are then left for you to categorize)."""
-    known = remembered_categories(db, [i["name"] for i in items])
-    for i in items:
-        if not i.get("category_id") and i["name"] in known:
-            i["category_id"] = known[i["name"]]
+    """Fill in category_id for items read without AI: items you've filed before first (item memory),
+    then one AI call for the rest. Returns an error message if the AI couldn't be reached."""
+    itemmemory.apply(db, items)
     todo = [i for i in items if not i.get("category_id")]
     if not todo or not ai.enabled(db):
         return None
@@ -102,6 +88,7 @@ def categorize_items(db, items, store=""):
     for idx, cid in res.items():
         if 0 <= idx < len(todo):
             todo[idx]["category_id"] = cid
+            todo[idx]["cat_source"] = "ai"
     return None
 
 

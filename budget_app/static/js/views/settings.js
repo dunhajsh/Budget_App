@@ -4,7 +4,7 @@ import { emailTab } from "./email.js";
 
 const TABS = [
   ["import", "Import & data"], ["categories", "Categories"], ["rules", "Merchant rules"],
-  ["cardmap", "Card categories"], ["recurring", "Recurring bills"], ["ai", "AI & receipts"], ["email", "Email"],
+  ["cardmap", "Card categories"], ["recurring", "Recurring bills"], ["ai", "AI & receipts"], ["email", "Email"], ["memory", "Item memory"],
 ];
 let tab = "import";
 
@@ -314,7 +314,39 @@ async function aiTab(el) {
   };
 }
 
-const RENDER = { import: importTab, categories: categoriesTab, rules: rulesTab, cardmap: cardmapTab, recurring: recurringTab, ai: aiTab, email: emailTab };
+async function memoryTab(el) {
+  const list = await api("/item-memory");
+  el.innerHTML = `<div class="panel">
+    <h2>Item memory</h2>
+    <p class="small muted" style="margin-top:0">When you save a receipt, the app remembers where you filed each item and files it the same way on
+      future receipts (Meijer, photos, Amazon, email) - your choice always beats the AI's guess. Similar names count as the same item
+      ("BANANAS 2.3 LB" = "Bananas"). Change a category here to re-file it everywhere it hasn't been reviewed yet.</p>
+    <div class="row" style="margin-bottom:10px"><input id="mq" placeholder="Search ${list.length} remembered items…" style="flex:1;max-width:360px"></div>
+    ${list.length ? `<div class="table-wrap"><table><thead><tr><th>Item</th><th>Category</th><th class="num">Times</th><th>Store</th><th></th></tr></thead>
+      <tbody id="mrows">${list.map((m) => `<tr data-k="${esc(m.key)}" data-q="${esc((m.name + " " + (m.merchant || "")).toLowerCase())}">
+        <td>${esc(m.name)}</td>
+        <td><select class="cat" data-mk="${esc(m.key)}">${catOptions(m.category_id)}</select></td>
+        <td class="num">${m.times}</td><td class="small muted">${esc(m.merchant || "")}</td>
+        <td><button class="small ghost" data-forget="${esc(m.key)}" title="Forget this item">✕</button></td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="muted small">Nothing yet. Open a receipt, check its item categories, and click Save - from then on those items are filed automatically.</div>`}
+  </div>`;
+  const q = el.querySelector("#mq");
+  if (q) q.oninput = () => el.querySelectorAll("#mrows tr").forEach((tr) => { tr.hidden = !tr.dataset.q.includes(q.value.toLowerCase()); });
+  el.querySelectorAll("[data-mk]").forEach((sel) => (sel.onchange = async () => {
+    if (!sel.value) return;
+    try {
+      const r = await api("/item-memory", { method: "PATCH", body: { key: sel.dataset.mk, category_id: +sel.value } });
+      toast(`Saved${r.updated_other_receipts ? ` - re-filed on ${r.updated_other_receipts} receipt item(s) not reviewed yet` : ""}`);
+    } catch (e) { fail(e); }
+  }));
+  el.querySelectorAll("[data-forget]").forEach((b) => (b.onclick = async () => {
+    await api(`/item-memory?key=${encodeURIComponent(b.dataset.forget)}`, { method: "DELETE" });
+    b.closest("tr").remove();
+    toast("Forgotten");
+  }));
+}
+
+const RENDER = { import: importTab, categories: categoriesTab, rules: rulesTab, cardmap: cardmapTab, recurring: recurringTab, ai: aiTab, email: emailTab, memory: memoryTab };
 
 export default {
   monthless: true,

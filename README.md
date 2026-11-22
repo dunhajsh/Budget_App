@@ -6,6 +6,7 @@ A local envelope-budgeting app that replaces a yearly Excel budget. It runs on y
 - **Imports card statements and bank accounts (CSV)**: purchases are sorted automatically by merchant rules that learn as you categorize ("Always put *Ulta* in *Beauty*?"). From bank accounts, bills are budgeted, paychecks and interest become income (optionally for next month's budget), and transfers and card payments are left out.
 - **Statements replace spreadsheet history, totals unchanged**: for months the spreadsheet already covers, each statement line takes the place of the spreadsheet entry it matches (exactly, split over several envelopes, several lines combined, or with a small typo kept as a visible difference) and takes that entry's envelope. Purchase/return pairs are added; lines the spreadsheet doesn't have are shown but not budgeted. Every month/envelope total is checked to the cent before anything is saved, and undo restores the spreadsheet entries. Merchant rules are learned from the result.
 - **Receipts**: drop in photos, PDFs or pasted email receipts. AI (a free local model through Ollama, or Claude) reads every line item, sorts each into an envelope/subcategory, finds the matching card charge, and splits that charge (tax spread proportionally). One $180 Meijer charge becomes Groceries › Produce, Toiletries, House › Household Supplies, …
+- **Item memory**: when you save a receipt, the app remembers where you filed each item and files the same product the same way on future receipts (your choice beats the AI's guess; "BANANAS 2.3 LB" = "Bananas"). Edit or forget items under Settings → Item memory.
 - **Amazon**: import your Amazon order history. Each shipment is matched to its card charge and split by item.
 - **Email receipts**: connect Gmail/Outlook/IMAP mailboxes (read-only). Order confirmations and digital receipts are found, read, matched to card charges and split, with no typing.
 - **Envelope budgeting**: income, monthly amounts per envelope ("Fill with usual amounts" / "Copy last month"), carry-over, overspending alerts.
@@ -76,6 +77,7 @@ budget_app/
   api.py              JSON API (Flask blueprint)
   budget.py           envelope math: carry-over, available, history
   categorize.py       merchant normalization + rules
+  itemmemory.py       remembered receipt-item categories
   receipts.py         receipt matching and tax-aware splitting
   ai.py               AI calls via Claude or local Ollama (receipt reading, categorization)
   emailscan.py        IMAP mailbox scanning for emailed receipts

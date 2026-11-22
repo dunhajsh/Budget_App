@@ -157,6 +157,16 @@ CREATE TABLE IF NOT EXISTS email_accounts (
     last_error   TEXT
 );
 
+-- Where you filed receipt items (normalized name -> category), learned from receipts you saved.
+CREATE TABLE IF NOT EXISTS item_memory (
+    key         TEXT PRIMARY KEY,
+    name        TEXT,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    merchant    TEXT,
+    times       INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Every email looked at, so nothing is read twice.
 CREATE TABLE IF NOT EXISTS email_seen (
     account_id  INTEGER NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
@@ -207,6 +217,15 @@ def _migrate(conn):
     if "batch_id" not in cols:
         conn.execute("ALTER TABLE income ADD COLUMN batch_id INTEGER")
     cols = {r[1] for r in conn.execute("PRAGMA table_info(transactions)")}
+    cols_items = {r[1] for r in conn.execute("PRAGMA table_info(receipt_items)")}
+    if "cat_source" not in cols_items:
+        # where an item's category came from: memory (your earlier choice) | ai | NULL (you / none)
+        conn.execute("ALTER TABLE receipt_items ADD COLUMN cat_source TEXT")
+    if not conn.execute("SELECT 1 FROM settings WHERE key = 'item_memory_seeded'").fetchone():
+        from .itemmemory import seed_from_reviewed
+        conn.row_factory = sqlite3.Row
+        seed_from_reviewed(conn)
+        conn.execute("INSERT INTO settings(key, value) VALUES ('item_memory_seeded', '1')")
     if "replaced_by" not in cols:
         # spreadsheet entries replaced by statement lines (import batch id); kept so an undo can restore them
         conn.execute("ALTER TABLE transactions ADD COLUMN replaced_by INTEGER")

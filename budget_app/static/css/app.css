@@ -111,6 +111,7 @@ h3 { font-size: 14px; }
   background: var(--warn-soft); color: var(--text); border: 1px solid transparent;
 }
 .alert.info { background: var(--accent-soft); }
+.dim { opacity: .45; pointer-events: none; }
 .alert .ico { font-size: 18px; }
 
 /* ---------- envelopes */

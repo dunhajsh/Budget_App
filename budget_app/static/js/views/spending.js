@@ -1,6 +1,7 @@
 // Spending breakdown: envelopes -> subcategories -> what's in them (stores, receipt items, charges).
 import { api, esc, hashParams, money, money0, monthAdd, monthLabel, state } from "../app.js";
 import { chart, hatch, otherGray, series } from "./charts.js";
+import { editCharge } from "./charge.js";
 
 const MAX_COLORS = 7;          // subcategories with their own color; the rest fold into "Other"
 let envId = null;
@@ -111,6 +112,10 @@ export default {
     const heat = (v) => (v > 0 ? `background: color-mix(in srgb, var(--accent) ${Math.round((v / heatMax) * 45)}%, transparent)` : "");
     const swatch = (c) => `<i class="swatch ${c === "hatch" ? "hatched" : ""}" style="${c === "hatch" ? "" : `background:${c}`}"></i>`;
     const segByKey = Object.fromEntries(matrixRows.map((r) => [r.key, r.seg]));
+    if (sel && sel.envId === envId) {
+      const fresh = sel.seg.key === "all" ? { ...sel.seg, values: total } : segByKey[sel.seg.key] || segs.find((x) => x.key === sel.seg.key);
+      if (fresh) sel.seg = fresh;
+    }
 
     // ------------------------------------------------ compare
     const [A, B] = cmp;
@@ -319,14 +324,14 @@ export default {
           : `<div class="alert info"><span class="ico">🧾</span><div>No receipt items in this period yet. Upload receipts (Meijer PDFs, photos, the Amazon order export) and
               apply them to their card charges to see exactly what these ${esc(money0(spent))} were spent on.</div></div>`}
 
-        <h3 style="margin:20px 0 8px">Charges <span class="muted small">(${txns.length})</span></h3>
+        <h3 style="margin:20px 0 8px">Charges <span class="muted small">(${txns.length}) · click a charge to change its category, split it or add a note</span></h3>
         <div class="table-wrap" style="max-height:420px"><table>
           <thead><tr><th>Date</th><th>Where</th><th class="num">Here</th><th class="num">Whole charge</th><th>From</th><th></th></tr></thead>
-          <tbody>${txns.map((t) => `<tr><td>${esc(t.date)}</td><td><span class="desc-main">${esc(t.who)}</span>${t.who !== t.description ? `<div class="desc-raw">${esc(t.description)}</div>` : ""}
+          <tbody>${txns.map((t) => `<tr class="clickable" data-tid="${t.id}" title="Edit this charge"><td>${esc(t.date)}</td><td><span class="desc-main">${esc(t.who)}</span>${t.who !== t.description ? `<div class="desc-raw">${esc(t.description)}</div>` : ""}
               ${t.category && t.category !== s.label && !s.own ? `<div class="desc-raw">${esc(t.category)}</div>` : ""}</td>
             <td class="num"><b>${money(t.amount)}</b></td><td class="num muted">${Math.abs(t.txn_amount - t.amount) > 0.004 ? money(t.txn_amount) : ""}</td>
             <td><span class="badge">${t.source === "excel" ? "spreadsheet" : esc(t.account || t.source)}</span></td>
-            <td class="small">${t.receipt_id ? `<a href="#/receipts?open=${t.receipt_id}">receipt</a> · ` : ""}<a href="#/transactions?month=${t.budget_month}">${esc(mShort(t.budget_month))} →</a></td></tr>`).join("")}</tbody>
+            <td class="small" style="white-space:nowrap">${t.receipt_id ? `<a href="#/receipts?open=${t.receipt_id}">receipt</a> · ` : ""}<button class="small ghost" data-edit="${t.id}">✎ Edit</button></td></tr>`).join("")}</tbody>
         </table></div>`;
 
       chart("sp-stores", {
@@ -353,6 +358,10 @@ export default {
       detailEl.querySelectorAll("[data-period]").forEach((b) => (b.onclick = () => {
         openDetail(b.dataset.period === "range" ? { seg: s, start: months[0], end: months[last] } : { seg: s, start: end, end });
       }));
+      detailEl.querySelectorAll("[data-tid]").forEach((tr) => (tr.onclick = (e) => {
+        if (e.target.closest("a")) return;
+        editCharge(+tr.dataset.tid, { onSaved: refresh });
+      }));
       detailEl.querySelectorAll("[data-item]").forEach((tr) => (tr.onclick = (e) => {
         if (e.target.closest("a")) return;
         detailEl.querySelector(`[data-buys="${CSS.escape(tr.dataset.item)}"]`)?.classList.toggle("hidden");
@@ -370,10 +379,17 @@ export default {
       const seg = segByKey[linkSel.sub === "own" ? "own" : `c${linkSel.sub}`];
       const m = months.includes(linkSel.m) ? linkSel.m : null;
       if (seg) openDetail({ seg, start: m || months[0], end: m || months[last] });
-    } else if (sel) drawDetail(false);
+    } else if (sel) await drawDetail(false);
 
     // ------------------------------------------------ controls
     const rerender = () => this.render(el, alive);
+    // after a charge is edited: redraw everything, keep the open drill-down and where you were on the page
+    const refresh = async () => {
+      const y = document.scrollingElement.scrollTop;
+      el.style.minHeight = `${el.offsetHeight}px`;
+      try { await rerender(); } finally { el.style.minHeight = ""; }
+      document.scrollingElement.scrollTop = y;
+    };
     const sq = el.querySelector("#show-quiet");
     if (sq) sq.onclick = () => { el.querySelectorAll("tr.quiet").forEach((r) => r.classList.remove("hidden")); sq.remove(); };
     el.querySelectorAll("[data-env]").forEach((tr) => (tr.onclick = () => {

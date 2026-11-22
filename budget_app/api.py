@@ -332,6 +332,14 @@ def _similar_ids(db, txn):
     )]
 
 
+@bp.get("/transactions/<int:tid>")
+def get_transaction(tid):
+    rows = _txn_rows(get_db(), "t.id = ?", [tid], limit=1)
+    if not rows:
+        abort(404)
+    return jsonify(rows[0])
+
+
 @bp.patch("/transactions/<int:tid>")
 def update_transaction(tid):
     db = get_db()

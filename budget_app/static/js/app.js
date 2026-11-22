@@ -190,6 +190,15 @@ let renderToken = 0;
 export async function render() {
   const name = currentView();
   const token = ++renderToken;
+  // links like #/transactions?month=2026-09 switch the month once (then the month arrows work as usual)
+  const hp = hashParams();
+  const linked = hp.get("month");
+  if (linked && /^\d{4}-\d{2}$/.test(linked)) {
+    state.month = linked;
+    localStorage.setItem("month", linked);
+    hp.delete("month");
+    history.replaceState(null, "", `#/${name}${hp.toString() ? `?${hp}` : ""}`);
+  }
   document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === name));
   document.getElementById("page-title").textContent = titles[name];
   document.getElementById("month-label").textContent = monthLabel(state.month);

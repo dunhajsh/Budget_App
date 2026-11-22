@@ -621,6 +621,18 @@ class TransactionFilterTests(unittest.TestCase):
         self.assertEqual(self.names(start="2026-09", category_id=3), ["SHOP B", "SHOP D"])
         self.assertEqual(len(self.names(limit=2)), 2)
 
+    def test_get_one_charge_and_split_it_into_subcategories(self):
+        with self.app.test_client() as c:
+            tid = self.db.execute("SELECT id FROM transactions WHERE description = 'SHOP A'").fetchone()[0]
+            t = c.get(f"/api/transactions/{tid}").get_json()
+            self.assertEqual((t["amount"], [s["category_id"] for s in t["splits"]]), (10.0, [1]))
+            self.assertEqual(c.get("/api/transactions/9999").status_code, 404)
+            c.put(f"/api/transactions/{tid}/splits", json={"splits": [{"category_id": 2, "amount": 6}, {"category_id": 1, "amount": 4}]})
+            c.patch(f"/api/transactions/{tid}", json={"notes": "party", "reviewed": True})
+            t = c.get(f"/api/transactions/{tid}").get_json()
+        self.assertEqual(sorted((s["category_id"], s["amount"]) for s in t["splits"]), [(1, 4.0), (2, 6.0)])
+        self.assertEqual((t["notes"], t["reviewed"]), ("party", 1))
+
 
 class ReceiptMatchingTests(unittest.TestCase):
     def setUp(self):

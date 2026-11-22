@@ -755,7 +755,7 @@ def list_receipts():
     st = request.args.get("status")
     args = []
     if st == "open":
-        where = "r.status != 'applied'"
+        where = "r.status NOT IN ('applied', 'reviewed')"
     q = f"""SELECT r.id, r.source, r.filename, r.merchant, r.purchase_date, r.total, r.tax, r.status, r.error,
                    r.transaction_id, r.created_at, t.description AS txn_description, t.amount AS txn_amount,
                    t.date AS txn_date,
@@ -832,8 +832,12 @@ def update_receipt(rid):
         receipts.save_items(db, rid, b["items"])
     if "transaction_id" in b:
         db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (b["transaction_id"] or None, rid))
-    db.execute("UPDATE receipts SET status = CASE WHEN status IN ('pending','error') THEN 'parsed' ELSE status END "
-               "WHERE id = ?", (rid,))
+    if b.get("reviewed"):
+        # Saved after looking it over: no longer "needs review" (an applied receipt stays applied).
+        db.execute("UPDATE receipts SET status = 'reviewed', error = NULL WHERE id = ? AND status != 'applied'", (rid,))
+    else:
+        db.execute("UPDATE receipts SET status = CASE WHEN status IN ('pending','error') THEN 'parsed' ELSE status END "
+                   "WHERE id = ?", (rid,))
     db.commit()
     return jsonify(receipts.get(db, rid))
 

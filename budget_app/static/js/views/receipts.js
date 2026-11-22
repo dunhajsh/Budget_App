@@ -5,6 +5,7 @@ const STATUS = {
   pending: ["Reading…", "accent"],
   parsed: ["Needs review", "warn"],
   applied: ["Applied", "good"],
+  reviewed: ["Reviewed", "good"],
   error: ["Needs attention", "bad"],
   duplicate: ["Duplicate", "warn"],
 };
@@ -80,7 +81,7 @@ export async function openReceipt(id) {
       ${r.stored_path || r.source === "text" || r.source === "email" ? `<button data-reparse ${state.status.ai_enabled ? "" : "disabled title='Turn on AI in Settings'"}>✨ Re-read</button>` : ""}
       <span class="spacer"></span>
       <button data-cash>Record as cash/debit</button>
-      <button data-save>Save</button>
+      <button data-save title="Save your changes and mark this receipt as reviewed">Save</button>
       <button class="primary" data-apply>Save & split the charge</button>`,
     onMount(root, close) {
       const drawItems = () => {
@@ -132,8 +133,9 @@ export async function openReceipt(id) {
         if (e.target.matches("[data-additem]")) { items.push({ name: "", quantity: 1, amount: 0, taxable: true, category_id: null }); drawItems(); }
       });
 
-      const save = async () => {
+      const save = async (reviewed = false) => {
         const body = {
+          reviewed,
           merchant: val("merchant"), purchase_date: val("purchase_date") || null,
           total: parseFloat(val("total")) || null, subtotal: parseFloat(val("subtotal")) || null, tax: parseFloat(val("tax")) || 0,
           items: items.map((i) => ({ ...i, amount: parseFloat(i.amount) || 0, quantity: parseFloat(i.quantity) || null })),
@@ -141,7 +143,9 @@ export async function openReceipt(id) {
         };
         return api(`/receipts/${r.id}`, { method: "PATCH", body });
       };
-      root.querySelector("[data-save]").onclick = async () => { try { await save(); close(); toast("Receipt saved"); render(); } catch (e) { fail(e); } };
+      root.querySelector("[data-save]").onclick = async () => {
+        try { await save(true); close(); toast("Receipt saved and marked as reviewed"); render(); } catch (e) { fail(e); }
+      };
       root.querySelector("[data-apply]").onclick = async () => {
         if (!chosen) return toast("Pick the card charge this receipt belongs to (or record it as cash/debit)", { error: true });
         if (items.some((i) => !i.category_id) && !confirm("Some items have no category - their share will stay uncategorized. Continue?")) return;
@@ -243,8 +247,9 @@ export default {
   async render(el, alive) {
     const list = await api("/receipts");
     if (!alive()) return;
-    const open = list.filter((r) => r.status !== "applied");
-    const done = list.filter((r) => r.status === "applied");
+    const isDone = (r) => r.status === "applied" || r.status === "reviewed";
+    const open = list.filter((r) => !isDone(r));
+    const done = list.filter(isDone);
     el.innerHTML = `<div class="stack">
       ${state.status.ai_enabled ? "" : `<div class="alert info"><span class="ico">✨</span><span>Turn on AI in <a href="#/settings">Settings</a> (a free local model, or Claude)
         and receipts will be read automatically - every line item extracted, categorized, and matched to the right card charge.
@@ -262,8 +267,8 @@ export default {
       </div>
       <div><div class="panel-head"><h2>To review</h2><span class="badge">${open.length}</span></div>
         ${open.length ? `<div class="receipt-list">${open.map(card).join("")}</div>` : `<div class="muted small">All caught up.</div>`}</div>
-      <div><div class="panel-head"><h2>Applied</h2><span class="badge">${done.length}</span></div>
-        ${done.length ? `<div class="receipt-list">${done.map(card).join("")}</div>` : `<div class="muted small">Receipts you've applied to a card charge show up here.</div>`}</div>
+      <div><div class="panel-head"><h2>Done</h2><span class="badge">${done.length}</span></div>
+        ${done.length ? `<div class="receipt-list">${done.map(card).join("")}</div>` : `<div class="muted small">Receipts you've saved after reviewing them, or applied to a card charge, show up here.</div>`}</div>
     </div>`;
 
     const dz = el.querySelector("#rz");

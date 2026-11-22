@@ -468,6 +468,28 @@ class ReceiptReadingTests(unittest.TestCase):
         totals = sorted((s["order_id"], s["total"]) for s in ships)
         self.assertEqual(totals, [("111-1", 54.21), ("222-2", 10.64), ("222-2", 17.04)])
 
+    def test_saving_a_receipt_marks_it_reviewed(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            app = create_app(data_dir=tmp, testing=True)
+            db = connect(os.path.join(tmp, "budget.db"))
+            db.execute("INSERT INTO receipts(id, source, merchant, purchase_date, total, status, raw_json) "
+                       "VALUES (1, 'text', 'Shop', '2026-10-01', 5, 'parsed', ?)", (json.dumps({"text": "MILK 5.00"}),))
+            db.commit()
+            with app.test_client() as c:
+                c.patch("/api/receipts/1", json={"merchant": "Shop", "items": [{"name": "Milk", "amount": 5}]})
+                self.assertEqual(c.get("/api/receipts/1").get_json()["status"], "parsed")     # plain edit: still to review
+                r = c.patch("/api/receipts/1", json={"reviewed": True}).get_json()
+                self.assertEqual(r["status"], "reviewed")
+                self.assertEqual(c.get("/api/receipts?status=open").get_json(), [])         # out of the review list
+            db.execute("UPDATE receipts SET status = 'applied' WHERE id = 1")
+            db.commit()
+            with app.test_client() as c:
+                self.assertEqual(c.patch("/api/receipts/1", json={"reviewed": True}).get_json()["status"], "applied")
+            db.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_duplicate_upload_is_flagged(self):
         tmp = tempfile.mkdtemp()
         try:

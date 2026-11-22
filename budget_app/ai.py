@@ -388,7 +388,10 @@ def parse_receipt(db, data=None, media_type=None, text=None, email=None, attachm
     mode = get_setting(db, "ollama_think") or "auto"
     res = _call(db, content, schema, system, think=(mode == "always"))
     if mode == "auto" and res.get("is_receipt", True) and not _looks_right(res):
-        res = _call(db, content, schema, system, think=True)
+        try:
+            res = _call(db, content, schema, system, think=True)
+        except AIError:
+            pass  # the careful read ran too long (very long receipt): keep the quick read; totals are flagged for review
     return _clean_receipt(res)
 
 

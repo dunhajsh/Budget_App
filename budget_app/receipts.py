@@ -72,8 +72,56 @@ def save_parsed(db, rid, res, text=None, email=None):
     save_items(db, rid, res["items"])
 
 
+def remembered_categories(db, names):
+    """Categories already given to items with these names on earlier receipts (yours or the AI's)."""
+    out = {}
+    for n in set(names):
+        r = db.execute(
+            """SELECT category_id FROM receipt_items i JOIN categories c ON c.id = i.category_id
+               WHERE LOWER(i.name) = LOWER(?) AND c.archived = 0 ORDER BY i.id DESC LIMIT 1""", (n,)).fetchone()
+        if r:
+            out[n] = r["category_id"]
+    return out
+
+
+def categorize_items(db, items, store=""):
+    """Fill in category_id for items read without AI: remembered names first, then one AI call for the rest.
+    Returns an error message if the AI couldn't be reached (items are then left for you to categorize)."""
+    known = remembered_categories(db, [i["name"] for i in items])
+    for i in items:
+        if not i.get("category_id") and i["name"] in known:
+            i["category_id"] = known[i["name"]]
+    todo = [i for i in items if not i.get("category_id")]
+    if not todo or not ai.enabled(db):
+        return None
+    try:
+        res = ai.categorize(db, [f"{i['name']} ({store}{', ' + i['department'].lower() + ' aisle' if i.get('department') else ''})"
+                                 for i in todo], kind=f"{store} receipt items".strip())
+    except ai.AIError as e:
+        return str(e)
+    for idx, cid in res.items():
+        if 0 <= idx < len(todo):
+            todo[idx]["category_id"] = cid
+    return None
+
+
 def run_parse(db, rid, data=None, media_type=None, text=None, email=None):
-    """Read a stored receipt with AI and save the result."""
+    """Read a stored receipt and save the result. Digital receipts in a known layout (e.g. Meijer PDFs)
+    are read exactly without AI; everything else goes to the AI."""
+    from .importers import receipt_text
+    plain = text or (receipt_text.pdf_text(data) if data is not None and media_type == "application/pdf" else "")
+    res = receipt_text.parse(plain) if plain and not email else None
+    if res:
+        err = categorize_items(db, res["items"], res["merchant"])
+        save_parsed(db, rid, res, text=text, email=email)
+        if err:
+            db.execute("UPDATE receipts SET error = ? WHERE id = ?",
+                       (f"Read the receipt, but couldn't categorize the items: {err}", rid))
+        return True
+    if not ai.enabled(db):
+        db.execute("UPDATE receipts SET status = 'parsed', error = ? WHERE id = ?",
+                   ("Turn on AI in Settings for automatic reading - or enter the items by hand.", rid))
+        return False
     try:
         res = ai.parse_receipt(db, data=data, media_type=media_type, text=text, email=email)
     except ai.AIError as e:
@@ -81,6 +129,92 @@ def run_parse(db, rid, data=None, media_type=None, text=None, email=None):
         return False
     save_parsed(db, rid, res, text=text, email=email)
     return True
+
+
+def duplicate_of(db, rid):
+    """Another receipt for the same purchase (same store, date and total), e.g. uploaded twice."""
+    r = db.execute("SELECT merchant, purchase_date, total FROM receipts WHERE id = ?", (rid,)).fetchone()
+    if not r or r["total"] is None or not r["purchase_date"]:
+        return None
+    store = (r["merchant"] or "").split()[:1]  # "MEIJER STORE" and "Meijer" are the same store
+    for d in db.execute("""SELECT id, merchant FROM receipts WHERE id != ? AND status != 'duplicate' AND purchase_date = ?
+                           AND ABS(total - ?) < 0.005 ORDER BY id""", (rid, r["purchase_date"], r["total"])):
+        if [w.lower() for w in (d["merchant"] or "").split()[:1]] == [w.lower() for w in store]:
+            return d["id"]
+    return None
+
+
+def process(db, rid, receipt_dir):
+    """Read one stored receipt, check for duplicates, and match it to a card charge."""
+    import mimetypes
+    import os
+    r = db.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
+    if not r:
+        return
+    src = source_of(db, rid)
+    data = mt = None
+    if r["stored_path"]:
+        path = os.path.join(receipt_dir, os.path.basename(r["stored_path"]))
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                data = f.read()
+            mt = "application/pdf" if path.lower().endswith(".pdf") else mimetypes.guess_type(path)[0]
+    if data is None and not src["text"]:
+        db.execute("UPDATE receipts SET status = 'error', error = 'The receipt file is missing.' WHERE id = ?", (rid,))
+        return
+    ok = run_parse(db, rid, data=data, media_type=mt, text=src["text"], email=src["email"])
+    if not ok:
+        return
+    dup = duplicate_of(db, rid)
+    if dup:
+        db.execute("UPDATE receipts SET status = 'duplicate', error = ?, transaction_id = NULL WHERE id = ?",
+                   (f"Same store, date and total as receipt #{dup} - probably uploaded twice. Delete this one.", rid))
+        return
+    if not r["transaction_id"]:
+        m = best_match(db, rid)
+        if m:
+            db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (m["id"], rid))
+
+
+class Worker:
+    """Reads uploaded receipts one at a time in the background, so uploads return immediately and
+    nothing is lost if the page is closed. Anything left 'pending' is picked up again on startup."""
+
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.thread = None
+        self.current = None
+
+    def kick(self, db_path, receipt_dir):
+        import threading
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.thread = threading.Thread(target=self._run, args=(db_path, receipt_dir), daemon=True)
+            self.thread.start()
+
+    def _run(self, db_path, receipt_dir):
+        from .db import connect
+        db = connect(db_path)
+        try:
+            while True:
+                r = db.execute("SELECT id FROM receipts WHERE status = 'pending' ORDER BY id LIMIT 1").fetchone()
+                if not r:
+                    break
+                self.current = r["id"]
+                try:
+                    process(db, r["id"], receipt_dir)
+                except Exception as e:  # never leave it pending forever
+                    db.execute("UPDATE receipts SET status = 'error', error = ? WHERE id = ?",
+                               (f"{type(e).__name__}: {e}", r["id"]))
+                db.commit()
+        finally:
+            self.current = None
+            db.close()
+
+
+WORKER = Worker()
 
 
 def candidates(db, rid, limit=8):

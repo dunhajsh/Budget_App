@@ -6,6 +6,7 @@ const STATUS = {
   parsed: ["Needs review", "warn"],
   applied: ["Applied", "good"],
   error: ["Needs attention", "bad"],
+  duplicate: ["Duplicate", "warn"],
 };
 
 function card(r) {
@@ -69,6 +70,9 @@ export async function openReceipt(id) {
         </div>
         <div>
           <h3 style="margin-bottom:8px">Card charge</h3>
+          ${r.transaction && state.status.spreadsheet_through && r.transaction.budget_month <= state.status.spreadsheet_through
+            ? `<div class="alert warn small" style="margin-bottom:8px"><span class="ico">⚠️</span><span>This charge is in ${esc(r.transaction.budget_month)}, a month your
+               spreadsheet covers. Splitting it changes that month's envelopes, so it won't match the spreadsheet any more.</span></div>` : ""}
           <div id="cands">${candHtml(r.candidates)}</div>
         </div>
       </div></div>`,
@@ -266,15 +270,13 @@ export default {
     const input = dz.querySelector("input");
     const upload = async (files) => {
       if (!files.length) return;
-      dz.innerHTML = `<span class="spinner"></span> ${state.status.ai_enabled ? `Reading ${files.length} receipt(s) - about ${state.status.ai_local ? "20 seconds to 2 minutes" : "10–30 seconds"} each…` : "Uploading…"}`;
+      dz.innerHTML = `<span class="spinner"></span> Uploading ${files.length} receipt(s)…`;
       const fd = new FormData();
       for (const f of files) fd.append("files", f);
       try {
         const res = await api("/receipts", { method: "POST", form: fd });
-        const errs = res.filter((r) => r.status === "error");
-        if (errs.length) toast(errs[0].error, { error: true });
+        toast(`${res.length} receipt(s) uploaded - they're being read in the background. You can keep using the app.`);
         await render();
-        if (res.length === 1) openReceipt(res[0].id);
       } catch (e) { fail(e); render(); }
     };
     dz.onclick = () => input.click();
@@ -288,6 +290,16 @@ export default {
       textDialog();
     };
     el.querySelectorAll("[data-open]").forEach((c) => (c.onclick = () => openReceipt(+c.dataset.open)));
+    // While receipts are being read in the background, refresh the list every few seconds.
+    const reading = open.filter((r) => r.status === "pending").length;
+    if (reading) {
+      const note = document.createElement("div");
+      note.className = "alert info";
+      note.innerHTML = `<span class="spinner"></span><span>Reading ${reading} receipt(s) in the background${state.status.ai_local ? " with your local model" : ""}…
+        This page updates by itself.</span>`;
+      el.querySelector(".stack").prepend(note);
+      setTimeout(() => { if (alive()) render(); }, 4000);
+    }
     scanPanel(el.querySelector("#email-scan"), alive).catch(() => {});
     const want = hashParams().get("open");
     if (want) { history.replaceState(null, "", "#/receipts"); openReceipt(+want); }

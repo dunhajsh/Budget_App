@@ -63,6 +63,7 @@ def status():
         ai_local=ai.provider(db) == "ollama",
         has_categories=bool(db.execute("SELECT 1 FROM categories LIMIT 1").fetchone()),
         latest_month=max(filter(None, [latest, latest_alloc]), default=date.today().strftime("%Y-%m")),
+        spreadsheet_through=db.execute("SELECT MAX(budget_month) FROM transactions WHERE source = 'excel'").fetchone()[0],
         months=months,
         accounts=[r["account"] for r in db.execute(
             "SELECT DISTINCT account FROM transactions WHERE account IS NOT NULL AND source != 'excel' ORDER BY account")],
@@ -748,6 +749,8 @@ ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf"}
 @bp.get("/receipts")
 def list_receipts():
     db = get_db()
+    if db.execute("SELECT 1 FROM receipts WHERE status = 'pending' LIMIT 1").fetchone():
+        receipts.WORKER.kick(current_app.config["DATABASE"], current_app.config["RECEIPT_DIR"])
     where = "1=1"
     st = request.args.get("status")
     args = []
@@ -791,23 +794,9 @@ def upload_receipts():
                          (f.filename, name))
         created.append((cur.lastrowid, path, ext, None))
     db.commit()
-
-    results = []
-    use_ai = ai.enabled(db)
-    for rid, path, ext, txt in created:
-        if use_ai:
-            data = open(path, "rb").read() if path else None
-            mt = "application/pdf" if ext == ".pdf" else (mimetypes.guess_type(path)[0] if path else None)
-            receipts.run_parse(db, rid, data=data, media_type=mt, text=txt)
-            m = receipts.best_match(db, rid)
-            if m:
-                db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (m["id"], rid))
-        else:
-            db.execute("UPDATE receipts SET status = 'parsed', error = ? WHERE id = ?",
-                       ("Add an API key in Settings for automatic reading - or enter the items by hand.", rid))
-        db.commit()
-        results.append(receipts.get(db, rid))
-    return jsonify(results)
+    # Read them in the background (a long receipt can take a minute with a local model).
+    receipts.WORKER.kick(current_app.config["DATABASE"], current_app.config["RECEIPT_DIR"])
+    return jsonify([receipts.get(db, rid) for rid, _, _, _ in created])
 
 
 @bp.get("/receipts/<int:rid>")

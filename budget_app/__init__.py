@@ -23,8 +23,11 @@ def create_app(data_dir=None, testing=False):
     app.teardown_appcontext(close_db)
 
     from .api import bp
+    from .receipts import WORKER
 
     app.register_blueprint(bp)
+    if not testing:  # finish reading any receipts left half-done (e.g. the app was closed mid-upload)
+        WORKER.kick(app.config["DATABASE"], app.config["RECEIPT_DIR"])
 
     @app.route("/")
     def index():

@@ -29,6 +29,11 @@ def _find(headers, *options):
     return None
 
 
+def _find_exact(headers, *options):
+    low = {h.lower().strip(): h for h in headers}
+    return next((low[o] for o in options if o in low), None)
+
+
 def _money(s):
     s = (str(s or "")).replace("$", "").replace(",", "").replace("'", "").strip()
     try:
@@ -59,10 +64,12 @@ def read_files(filename, data):
         out = []
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             for n in z.namelist():
-                if n.lower().endswith(".csv") and "orderhistory" in n.lower().replace(".", "").replace("_", ""):
+                key = n.lower().replace(".", "").replace("_", "").replace(" ", "")
+                # "Retail.OrderHistory.1.csv" (older exports) or "Your Amazon Orders/Order History.csv" (newer)
+                if n.lower().endswith(".csv") and "orderhistory" in key and "digital" not in key:
                     out.append(z.read(n).decode("utf-8-sig", errors="replace"))
         if not out:
-            raise ValueError("No Retail.OrderHistory CSV found in that zip.")
+            raise ValueError("No order history CSV found in that zip (looked for 'Order History.csv' / 'Retail.OrderHistory').")
         return out
     return [data.decode("utf-8-sig", errors="replace")]
 
@@ -76,9 +83,14 @@ def parse_shipments(texts, since=None):
         c_odate = _find(h, "order date", "date")
         c_sdate = _find(h, "ship date", "shipment date")
         c_name = _find(h, "product name", "title", "description", "item")
-        c_amt = _find(h, "total owed", "item total", "total", "price", "amount")
+        # What was actually charged per item (tax and discounts included). Never the "Shipment Item
+        # Subtotal" column: that's the pre-tax subtotal of the whole shipment, repeated on every item row.
+        c_amt = _find_exact(h, "total owed", "total amount", "item total") or _find(
+            [x for x in h if not any(w in x.lower() for w in ("subtotal", "tax", "discount", "shipping"))],
+            "total", "amount", "price")
         c_qty = _find(h, "quantity", "qty")
         c_status = _find(h, "order status", "status")
+        c_track = _find_exact(h, "carrier name & tracking number", "tracking number")
         if not (c_order and c_odate and c_name and c_amt):
             raise ValueError("Couldn't recognize the Amazon export columns: " + ", ".join(h))
         for row in reader:
@@ -93,8 +105,11 @@ def parse_shipments(texts, since=None):
             amt = _money(row.get(c_amt))
             if amt is None:
                 continue
-            key = (row[c_order].strip(), d.isoformat())
-            s = shipments.setdefault(key, {"order_id": key[0], "date": d, "order_date": odate, "items": []})
+            # One card charge per shipment: group by tracking number when the export has it.
+            track = (row.get(c_track) or "").strip() if c_track else ""
+            track = "" if track.lower().startswith("not ") else track
+            key = (row[c_order].strip(), d.isoformat(), track)
+            s = shipments.setdefault(key, {"order_id": key[0], "date": d, "order_date": odate, "items": [], "tracking": track})
             qty = _money(row.get(c_qty)) if c_qty else None
             s["items"].append({"name": row[c_name].strip()[:200], "quantity": qty or 1, "amount": amt})
     for s in shipments.values():
@@ -106,7 +121,7 @@ def import_orders(db, filename, data, since=None, use_ai=True):
     shipments = parse_shipments(read_files(filename, data), since=since)
     created, skipped, rids = 0, 0, []
     for s in shipments:
-        ext = f"amazon|{s['order_id']}|{s['date'].isoformat()}"
+        ext = f"amazon|{s['order_id']}|{s['date'].isoformat()}" + (f"|{s['tracking']}" if s.get("tracking") else "")
         if db.execute("SELECT 1 FROM receipts WHERE external_id = ?", (ext,)).fetchone():
             skipped += 1
             continue
@@ -149,6 +164,7 @@ def match_amazon(db, rids=None):
         args = rids
     pending = [dict(r) for r in db.execute(q, args)]
     used = {r["transaction_id"] for r in db.execute("SELECT transaction_id FROM receipts WHERE transaction_id IS NOT NULL")}
+    last_sheet = db.execute("SELECT MAX(budget_month) FROM transactions WHERE source = 'excel'").fetchone()[0]
     matched = 0
     for r in sorted(pending, key=lambda r: r["purchase_date"]):
         d = date.fromisoformat(r["purchase_date"])
@@ -165,7 +181,10 @@ def match_amazon(db, rids=None):
         t = cands[0]
         used.add(t["id"])
         items = db.execute("SELECT category_id FROM receipt_items WHERE receipt_id = ?", (r["id"],)).fetchall()
-        if items and all(i["category_id"] for i in items):
+        in_sheet_month = t["budget_month"] <= (last_sheet or "")
+        # Split the charge automatically only if you haven't reviewed it yet, and never in spreadsheet months
+        # (those must keep matching the sheet). Otherwise just link it so you can apply it from Receipts.
+        if items and all(i["category_id"] for i in items) and not in_sheet_month and not t["reviewed"]:
             receipts.apply(db, r["id"], t["id"])
         else:
             db.execute("UPDATE receipts SET transaction_id = ? WHERE id = ?", (t["id"], r["id"]))

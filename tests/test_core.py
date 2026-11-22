@@ -408,6 +408,79 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM transactions WHERE source = 'excel' AND excluded = 0").fetchone()[0], 6)
 
 
+MEIJER_TEXT = """          11/18/26      Fastlane100
+    MEIJER SAVINGS
+    SPECIALS                      11.39
+SAVINGS TOTAL   11.39
+GENERAL MERCHANDISE
+5209243396     CAKE PAN           4.29  CT
+DRUGSTORE
+81002713166    BANDAGES           7.99 + T
+71928311084    DIAPER PASTE       4.49 +
+GROCERY
+7490404011     BANANAS            1.28  F
+     2.66 lb @   1 lb /     .48
+76101004770    AVOCADOS
+     2  @  2.59                   5.18  F
+70882097452    GR BEEF
+     2  @  6.79                  13.58  F
+ => 50% off 6.79                 -3.40  F
+*71373356251   PUMPKIN
+     was      2.19       now      1.49  F
+*71575610001   RASPBERRIES
+     3  @ 3 / 5.00
+     was     11.07       now      5.00  F
+71928314559    ROTSSERIE CHCK     6.99
+ => 15.00 off                    -5.00
+            mPerks # -- ********27
+TOTAL
+             OH 6.50% Sales Tax    .80
+             TOTAL TAX             .80
+             TOTAL               42.69
+PAYMENTS
+  CREDIT CARDS         TENDER    42.69
+"""
+
+AMAZON_NEW = """Order ID,Order Date,Ship Date,Product Name,Shipment Item Subtotal,Shipment Item Subtotal Tax,Total Amount,Unit Price,Original Quantity,Order Status,Carrier Name & Tracking Number
+111-1,2026-10-29T15:36:18Z,2026-10-30T00:27:33Z,Vitamins,50.90,3.31,27.64,25.95,1,Closed,AMZN_US(TBA1)
+111-1,2026-10-29T15:36:18Z,2026-10-30T00:27:33Z,Washer cleaner,50.90,3.31,26.57,24.95,1,Closed,AMZN_US(TBA1)
+222-2,2026-09-30T02:34:51Z,2026-10-01T04:39:14Z,Iron,30.99,2.01,17.04,16.00,1,Closed,AMZN_US(TBA2)
+222-2,2026-09-30T02:34:51Z,2026-10-01T09:24:23Z,Lotion,9.99,0.65,10.64,9.99,1,Closed,AMZN_US(TBA3)
+"""
+
+
+class ReceiptReadingTests(unittest.TestCase):
+    def test_meijer_text_is_read_exactly(self):
+        from budget_app.importers.receipt_text import parse
+        r = parse(MEIJER_TEXT)
+        self.assertIsNotNone(r)
+        self.assertEqual((r["purchase_date"], r["tax"], r["total"]), ("2026-11-18", 0.80, 42.69))
+        amounts = {i["name"]: (i["amount"], i["taxable"]) for i in r["items"]}
+        self.assertEqual(amounts["Gr Beef"], (10.18, False))       # 2 @ 6.79, minus the 50% off line
+        self.assertEqual(amounts["Raspberries"], (5.00, False))    # was/now line, unit-price note ignored
+        self.assertEqual(amounts["Bandages"], (7.99, True))        # "+ T" health item, taxed
+        self.assertEqual(amounts["Rotsserie Chck"], (1.99, False))  # no flag; coupon line folded in
+        self.assertEqual(len(r["items"]), 9)
+        self.assertIsNone(parse(MEIJER_TEXT.replace("42.69", "50.00")))   # doesn't add up -> AI fallback
+
+    def test_amazon_new_export_uses_charged_amounts_per_shipment(self):
+        ships = amazon.parse_shipments([AMAZON_NEW])
+        totals = sorted((s["order_id"], s["total"]) for s in ships)
+        self.assertEqual(totals, [("111-1", 54.21), ("222-2", 10.64), ("222-2", 17.04)])
+
+    def test_duplicate_upload_is_flagged(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            db = make_db(tmp)
+            from budget_app import receipts
+            for m in ("MEIJER STORE", "Meijer"):
+                db.execute("INSERT INTO receipts(source, merchant, purchase_date, total, status) VALUES ('upload', ?, '2026-10-15', 205.24, 'parsed')", (m,))
+            self.assertEqual(receipts.duplicate_of(db, 2), 1)
+            db.close()
+        finally:
+            shutil.rmtree(tmp)
+
+
 class LocalModelTests(unittest.TestCase):
     """The Ollama path, with the HTTP call replaced by a fake."""
 

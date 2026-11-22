@@ -165,6 +165,8 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft
 input.money { width: 100px; text-align: right; font-variant-numeric: tabular-nums; }
 select.cat { max-width: 220px; width: 100%; }
 select.cat.uncat { border-color: var(--warn); background: var(--warn-soft); }
+#cat-sel.filtering { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.split-hit { font-weight: 600; }
 label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
 textarea { width: 100%; min-height: 90px; resize: vertical; }
 

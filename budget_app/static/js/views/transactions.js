@@ -1,14 +1,29 @@
-import { api, catName, catOptions, esc, fail, hashParams, modal, money, monthLabel, render, state, toast } from "../app.js";
+import { api, catName, catOptions, esc, fail, hashParams, modal, money, monthAdd, monthLabel, render, state, toast } from "../app.js";
 
 let filter = "all";
 let search = "";
+let catSel = "";        // "" = all, "none" = no category, or a category id (an envelope includes its subcategories)
+let range = "month";    // "month" | "3" | "12" | "all"
+const PAGE = 500;       // most rows shown at once when looking at more than one month
+let truncated = false;
 let selected = new Set();
 let txns = [];
 
 // A spreadsheet entry that no statement line has been matched to yet (no real merchant name).
 const unnamed = (t) => t.source === "excel" && / \(spreadsheet\)$/.test(t.description || "");
 const titleCase = (s) => (s || "").toLowerCase().replace(/\b([a-z])/g, (c) => c.toUpperCase());
-const shortDate = (d) => new Date(d + "T12:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
+const shortDate = (d) => new Date(d + "T12:00").toLocaleDateString("en-US",
+  { month: "short", day: "numeric", ...(range !== "month" && d.slice(0, 4) !== String(new Date().getFullYear()) ? { year: "numeric" } : {}) });
+const RANGES = [["month", "This month"], ["3", "Last 3 months"], ["12", "Last 12 months"], ["all", "All months"]];
+const rangeLabel = () => (range === "month" ? monthLabel(state.month) : RANGES.find(([k]) => k === range)[1].toLowerCase());
+
+// Does this split fall under the category picked in the filter?
+function inFilter(s) {
+  if (!catSel) return true;
+  if (catSel === "none") return !s.category_id;
+  const c = state.flat.find((x) => x.id === s.category_id);
+  return !!c && (c.id === +catSel || c.parent_id === +catSel);
+}
 
 function catCell(t) {
   if (t.excluded && /^Counted as income/.test(t.notes || "")) return `<span class="badge good" title="${esc(t.notes)}">Counted as income</span>`;
@@ -16,7 +31,7 @@ function catCell(t) {
     ? `<span class="badge warn" title="${esc(t.notes)}">Not in spreadsheet · not budgeted</span>`
     : `<span class="badge">Not budgeted (payment/transfer)</span>`;
   if (t.splits.length > 1) {
-    return `<div class="small">${t.splits.map((s) => `<div>${esc(catName(s.category_id))} <span class="muted">${money(s.amount)}</span></div>`).join("")}</div>`;
+    return `<div class="small">${t.splits.map((s) => `<div class="${catSel ? (inFilter(s) ? "split-hit" : "muted") : ""}">${esc(catName(s.category_id))} <span class="muted">${money(s.amount)}</span></div>`).join("")}</div>`;
   }
   const cid = t.splits[0]?.category_id || null;
   return `<select class="cat ${cid ? "" : "uncat"}" data-cat="${t.id}">${catOptions(cid)}</select>`;
@@ -44,22 +59,35 @@ function row(t) {
 }
 
 async function load(el, alive) {
-  const p = hashParams();
-  const cat = p.get("category");
-  const qs = new URLSearchParams({ month: state.month });
+  const qs = new URLSearchParams();
+  if (range === "month") qs.set("month", state.month);
+  else {
+    if (range !== "all") { qs.set("start", monthAdd(state.month, -(+range - 1))); qs.set("end", state.month); }
+    qs.set("limit", PAGE + 1);
+  }
   if (filter !== "all") qs.set("filter", filter);
   if (search) qs.set("q", search);
-  if (cat) qs.set("category_id", cat);
+  if (catSel) qs.set("category_id", catSel);
   txns = await api(`/transactions?${qs}`);
   if (!alive()) return;
+  truncated = range !== "month" && txns.length > PAGE;
+  if (truncated) txns = txns.slice(0, PAGE);
   const body = el.querySelector("#txn-body");
-  const total = txns.filter((t) => !t.excluded).reduce((a, t) => a + t.amount, 0);
-  el.querySelector("#txn-count").textContent = `${txns.length} transactions · ${money(total)}`;
-  el.querySelector("#cat-filter").innerHTML = cat
-    ? `<span class="badge accent">Category: ${esc(catName(+cat))} <a href="#/transactions" style="margin-left:4px">✕</a></span>` : "";
+  const counted = txns.filter((t) => !t.excluded);
+  const total = counted.reduce((a, t) => a + t.amount, 0);
+  let line = `${truncated ? `Latest ${PAGE}` : txns.length} transactions · ${money(total)}`;
+  if (catSel) {
+    const inCat = counted.reduce((a, t) => a + (t.splits.length ? t.splits.filter(inFilter).reduce((b, s) => b + s.amount, 0)
+      : catSel === "none" ? t.amount : 0), 0);
+    if (Math.abs(inCat - total) > 0.005) line += ` · ${money(inCat)} of it in ${catSel === "none" ? "no category" : catName(+catSel)}`;
+  }
+  if (range !== "month") line += ` · ${rangeLabel()}`;
+  if (truncated) line += " · pick a category or search to see older ones";
+  el.querySelector("#txn-count").textContent = line;
   body.innerHTML = txns.length ? txns.map(row).join("")
-    : `<tr><td colspan="6"><div class="empty"><div class="big">📭</div>Nothing here for ${monthLabel(state.month)}.
-        ${filter === "all" && !search ? `<br><br><button class="primary" data-import>Import a statement</button>` : ""}</div></td></tr>`;
+    : `<tr><td colspan="6"><div class="empty"><div class="big">📭</div>Nothing ${catSel || search ? "matches" : "here"} for ${rangeLabel()}.
+        ${range === "month" && (catSel || search) ? `<br><br><button data-range-all>Look in all months</button>` : ""}
+        ${filter === "all" && !search && !catSel ? `<br><br><button class="primary" data-import>Import a statement</button>` : ""}</div></td></tr>`;
   updateBulk(el);
 }
 
@@ -326,6 +354,8 @@ export default {
   async render(el, alive) {
     const p = hashParams();
     if (p.get("filter")) filter = p.get("filter");
+    catSel = p.get("category") || "";
+    if (p.get("range")) range = p.get("range");
     selected = new Set();
     el.innerHTML = `<div class="panel">
       <div class="panel-head">
@@ -333,8 +363,11 @@ export default {
           ${[["all", "All"], ["uncategorized", "Needs category"], ["review", "Needs review"], ["split", "Split"]]
             .map(([k, l]) => `<span class="chip ${filter === k ? "active" : ""}" data-f="${k}">${l}</span>`).join("")}
         </div>
-        <span id="cat-filter"></span>
-        <input id="search" placeholder="Search…" value="${esc(search)}" style="width:180px">
+        <select id="cat-sel" class="${catSel ? "filtering" : ""}" title="Show only charges with a part filed in this category (an envelope includes its subcategories)" style="max-width:220px">
+          <option value="">All categories</option><option value="none" ${catSel === "none" ? "selected" : ""}>No category yet</option>
+          ${catOptions(catSel && catSel !== "none" ? +catSel : null, { empty: null })}</select>
+        <select id="range" title="Which budget months to look in">${RANGES.map(([k, l]) => `<option value="${k}" ${range === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <input id="search" type="search" placeholder="Search store, amount, category…" value="${esc(search)}" style="width:220px">
         <span class="spacer"></span>
         <button data-rules title="Re-run your merchant rules on uncategorized transactions">⚡ Run rules</button>
         ${state.status.ai_enabled ? `<button data-ai title="Ask the AI to suggest categories for the rest">✨ Suggest categories</button>` : ""}
@@ -361,13 +394,25 @@ export default {
       if (!f) return;
       filter = f;
       el.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.f === f));
+      remember();
       load(el, alive);
     };
+    // Keep the category and range in the address so Back and links return to the same view (without re-rendering).
+    const remember = () => {
+      const h = new URLSearchParams(hashParams());
+      catSel ? h.set("category", catSel) : h.delete("category");
+      range !== "month" ? h.set("range", range) : h.delete("range");
+      filter !== "all" ? h.set("filter", filter) : h.delete("filter");
+      history.replaceState(null, "", `#/transactions${h.toString() ? `?${h}` : ""}`);
+    };
+    el.querySelector("#cat-sel").onchange = (e) => { catSel = e.target.value; e.target.classList.toggle("filtering", !!catSel); remember(); load(el, alive); };
+    el.querySelector("#range").onchange = (e) => { range = e.target.value; remember(); load(el, alive); };
     let t;
     el.querySelector("#search").oninput = (e) => { clearTimeout(t); t = setTimeout(() => { search = e.target.value; load(el, alive); }, 250); };
 
     el.addEventListener("change", async (e) => {
       const tgt = e.target;
+      if (tgt.id === "cat-sel" || tgt.id === "range") return;
       if (tgt.dataset.cat) {
         const tx = txns.find((x) => x.id === +tgt.dataset.cat);
         const cid = tgt.value ? +tgt.value : null;
@@ -401,6 +446,7 @@ export default {
     el.addEventListener("click", async (e) => {
       const b = e.target.closest("button, [data-import]");
       if (!b) return;
+      if (b.dataset.rangeAll !== undefined) { range = "all"; el.querySelector("#range").value = "all"; remember(); return load(el, alive); }
       const tx = (k) => txns.find((x) => x.id === +b.dataset[k]);
       try {
         if (b.dataset.import !== undefined) return importDialog();

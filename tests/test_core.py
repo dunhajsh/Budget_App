@@ -583,6 +583,45 @@ class ItemMemoryTests(unittest.TestCase):
         self.assertEqual([i["category_id"] for i in items], [1, 3])
 
 
+class TransactionFilterTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.app = create_app(data_dir=self.tmp, testing=True)
+        db = self.db = connect(os.path.join(self.tmp, "budget.db"))
+        db.execute("INSERT INTO categories(id, name) VALUES (1, 'Food'), (3, 'House')")
+        db.execute("INSERT INTO categories(id, name, parent_id) VALUES (2, 'Snacks', 1)")
+        for d, desc, amount, splits in [
+            ("2026-08-03", "SHOP A", 10.00, [(1, 10.00)]),
+            ("2026-10-05", "SHOP B", 30.00, [(2, 12.50), (3, 17.50)]),
+            ("2026-10-07", "SHOP C", 8.25, []),
+            ("2026-10-09", "SHOP D", 5.00, [(3, 5.00)]),
+        ]:
+            tid = db.execute("INSERT INTO transactions(date, description, merchant, amount, source, budget_month) "
+                             "VALUES (?, ?, ?, ?, 'statement', ?)", (d, desc, desc, amount, d[:7])).lastrowid
+            for cid, a in splits:
+                db.execute("INSERT INTO splits(transaction_id, category_id, amount) VALUES (?, ?, ?)", (tid, cid, a))
+        db.commit()
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def names(self, **q):
+        with self.app.test_client() as c:
+            return sorted(t["description"] for t in c.get("/api/transactions", query_string=q).get_json())
+
+    def test_filter_by_category_months_and_search(self):
+        self.assertEqual(self.names(month="2026-10", category_id=1), ["SHOP B"])        # envelope includes Snacks
+        self.assertEqual(self.names(start="2026-08", end="2026-10", category_id=1), ["SHOP A", "SHOP B"])
+        self.assertEqual(self.names(category_id=2), ["SHOP B"])                         # all months
+        self.assertEqual(self.names(month="2026-10", category_id="none"), ["SHOP C"])
+        self.assertEqual(self.names(q="snack"), ["SHOP B"])                             # by category name
+        self.assertEqual(self.names(q="food"), ["SHOP A", "SHOP B"])                    # by envelope name
+        self.assertEqual(self.names(q="8.25"), ["SHOP C"])
+        self.assertEqual(self.names(start="2026-09", category_id=3), ["SHOP B", "SHOP D"])
+        self.assertEqual(len(self.names(limit=2)), 2)
+
+
 class ReceiptMatchingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

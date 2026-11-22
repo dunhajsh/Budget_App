@@ -262,7 +262,15 @@ def list_transactions():
     db = get_db()
     where, args = ["t.replaced_by IS NULL"], []
     month = request.args.get("month")
-    if month:
+    start, end = request.args.get("start"), request.args.get("end")
+    if start or end:  # a range of budget months (either end may be open)
+        if start:
+            where.append("t.budget_month >= ?")
+            args.append(_month(start))
+        if end:
+            where.append("t.budget_month <= ?")
+            args.append(_month(end))
+    elif month:
         where.append("t.budget_month = ?")
         args.append(_month(month))
     if request.args.get("include_excel") == "0":
@@ -276,15 +284,23 @@ def list_transactions():
     elif f == "split":
         where.append("(SELECT COUNT(*) FROM splits s WHERE s.transaction_id = t.id) > 1")
     cat = request.args.get("category_id")
-    if cat:
+    if cat == "none":  # any part of the charge has no category
+        where.append("t.excluded = 0 AND (NOT EXISTS (SELECT 1 FROM splits s WHERE s.transaction_id = t.id) "
+                     "OR EXISTS (SELECT 1 FROM splits s WHERE s.transaction_id = t.id AND s.category_id IS NULL))")
+    elif cat:  # an envelope includes its subcategories
         where.append("EXISTS (SELECT 1 FROM splits s JOIN categories c ON c.id = s.category_id "
                      "WHERE s.transaction_id = t.id AND (c.id = ? OR c.parent_id = ?))")
         args += [int(cat), int(cat)]
     q = (request.args.get("q") or "").strip()
     if q:
-        where.append("(t.description LIKE ? OR t.notes LIKE ? OR CAST(t.amount AS TEXT) LIKE ?)")
-        args += [f"%{q}%"] * 3
-    return jsonify(_txn_rows(db, " AND ".join(where), args))
+        # Description, note, amount, the category (or its envelope) any part is filed in, and split notes.
+        where.append("""(t.description LIKE ? OR t.merchant LIKE ? OR t.notes LIKE ? OR printf('%.2f', t.amount) LIKE ?
+                         OR EXISTS (SELECT 1 FROM splits s LEFT JOIN categories c ON c.id = s.category_id
+                                    LEFT JOIN categories p ON p.id = c.parent_id
+                                    WHERE s.transaction_id = t.id AND (c.name LIKE ? OR p.name LIKE ? OR s.memo LIKE ?)))""")
+        args += [f"%{q.lstrip('$')}%" if i == 3 else f"%{q}%" for i in range(7)]
+    limit = min(int(request.args.get("limit") or 2000), 5000)
+    return jsonify(_txn_rows(db, " AND ".join(where), args, limit=limit))
 
 
 @bp.post("/transactions")
